@@ -1,0 +1,24 @@
+# tokyonight (night) — mini-lele's default.
+# Copy this file to ~/.lele/themes/mine.toml and edit; every key is optional and
+# anything you leave out inherits from here.
+name = "tokyonight"
+
+# "none" keeps your terminal's background (and its transparency). Set a hex
+# value only if you want mini-lele to paint over it.
+bg = "none"
+
+fg       = "#c0caf5"
+muted    = "#565f89"
+accent   = "#7aa2f7"
+border   = "#292e42"
+
+user     = "#7dcfff"
+tool     = "#bb9af7"
+thinking = "#9ece6a"
+
+ok       = "#9ece6a"
+warn     = "#e0af68"
+err      = "#f7768e"
+
+add      = "#9ece6a"
+del      = "#f7768e"

@@ -1,0 +1,10 @@
+[package]
+name = "protocol"
+description = "Pure data structures exchanged between the runtime and its frontends."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

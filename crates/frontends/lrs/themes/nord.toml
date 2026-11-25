@@ -1,0 +1,19 @@
+name = "nord"
+
+bg = "none"
+
+fg       = "#d8dee9"
+muted    = "#4c566a"
+accent   = "#88c0d0"
+border   = "#3b4252"
+
+user     = "#8fbcbb"
+tool     = "#b48ead"
+thinking = "#a3be8c"
+
+ok       = "#a3be8c"
+warn     = "#ebcb8b"
+err      = "#bf616a"
+
+add      = "#a3be8c"
+del      = "#bf616a"

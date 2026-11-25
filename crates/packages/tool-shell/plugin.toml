@@ -1,0 +1,8 @@
+id = "tool-shell"
+name = "tool-shell"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "tool"
+name = "bash"

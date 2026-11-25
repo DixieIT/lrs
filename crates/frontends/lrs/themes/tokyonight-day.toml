@@ -1,0 +1,20 @@
+# tokyonight-day — the light counterpart. Pairs with a light terminal background.
+name = "tokyonight-day"
+
+bg = "none"
+
+fg       = "#3760bf"
+muted    = "#848cb5"
+accent   = "#2e7de9"
+border   = "#c4c8da"
+
+user     = "#007197"
+tool     = "#9854f1"
+thinking = "#587539"
+
+ok       = "#587539"
+warn     = "#8c6c3e"
+err      = "#f52a65"
+
+add      = "#587539"
+del      = "#f52a65"

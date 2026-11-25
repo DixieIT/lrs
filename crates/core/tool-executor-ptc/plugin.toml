@@ -1,0 +1,8 @@
+id = "tool-executor-ptc"
+name = "tool-executor-ptc"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "service"
+name = "ptc"

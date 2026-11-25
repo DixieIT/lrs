@@ -1,0 +1,8 @@
+id = "tool-executor-native"
+name = "tool-executor-native"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "service"
+name = "native"

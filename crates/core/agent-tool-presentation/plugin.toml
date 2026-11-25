@@ -1,0 +1,8 @@
+id = "agent-tool-presentation"
+name = "agent-tool-presentation"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "service"
+name = "agent-tool-presentation"

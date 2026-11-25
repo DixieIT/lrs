@@ -1,0 +1,19 @@
+name = "gruvbox-dark"
+
+bg = "none"
+
+fg       = "#ebdbb2"
+muted    = "#928374"
+accent   = "#83a598"
+border   = "#3c3836"
+
+user     = "#8ec07c"
+tool     = "#d3869b"
+thinking = "#b8bb26"
+
+ok       = "#b8bb26"
+warn     = "#fabd2f"
+err      = "#fb4934"
+
+add      = "#b8bb26"
+del      = "#fb4934"

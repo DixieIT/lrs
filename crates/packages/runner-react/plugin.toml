@@ -1,0 +1,8 @@
+id = "runner-react"
+name = "runner-react"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "runner"
+name = "react"

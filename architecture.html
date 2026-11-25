@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lele architecture</title>
+<style>
+  :root {
+    --bg:#ffffff; --panel:#f6f8fa; --fg:#1f2328; --dim:#59636e; --edge:#d1d9e0;
+    --contract:#0969da; --runtime:#8250df; --core:#1a7f37; --pkg:#9a6700;
+    --support:#57606a; --front:#bf3989; --bad:#cf222e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0d1117; --panel:#161b22; --fg:#e6edf3; --dim:#8d96a0; --edge:#30363d;
+      --contract:#58a6ff; --runtime:#bc8cff; --core:#3fb950; --pkg:#d29922;
+      --support:#8b949e; --front:#f778ba; --bad:#f85149;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0d1117; --panel:#161b22; --fg:#e6edf3; --dim:#8d96a0; --edge:#30363d;
+    --contract:#58a6ff; --runtime:#bc8cff; --core:#3fb950; --pkg:#d29922;
+    --support:#8b949e; --front:#f778ba; --bad:#f85149;
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:1180px; margin:0 auto; padding:32px 16px 64px }
+  code, .mono { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:.92em }
+  h1 { font-size:22px; margin:0 0 4px }
+  h2 { font-size:17px; margin:40px 0 6px }
+  .sub { color:var(--dim); margin:0 0 8px; max-width:78ch }
+  nav { display:flex; flex-wrap:wrap; gap:6px 14px; margin:18px 0 8px; font-size:13px }
+  nav a { color:var(--contract); text-decoration:none }
+  nav a:hover { text-decoration:underline }
+  .panel { background:var(--panel); border:1px solid var(--edge); border-radius:10px;
+           padding:16px; margin-top:12px; overflow-x:auto }
+  .mermaid { min-width:640px; text-align:center }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px; margin-top:12px }
+  .card { background:var(--panel); border:1px solid var(--edge); border-left:4px solid currentColor;
+          border-radius:8px; padding:12px }
+  .card b { display:block; margin-bottom:2px; color:var(--fg) }
+  .card small { color:var(--dim); display:block }
+  .contract { color:var(--contract) } .runtime { color:var(--runtime) } .core { color:var(--core) }
+  .pkg { color:var(--pkg) } .support { color:var(--support) } .front { color:var(--front) }
+  table { border-collapse:collapse; width:100%; font-size:13px }
+  td, th { text-align:left; padding:6px 12px 6px 0; border-bottom:1px solid var(--edge); vertical-align:top }
+  th { color:var(--dim); font-weight:600 }
+  .ok { color:var(--core); font-weight:600 } .no { color:var(--bad); font-weight:600 }
+  ol.notes { margin:10px 0 0; padding-left:20px; color:var(--dim); max-width:90ch }
+  ol.notes li { margin:4px 0 }
+  ol.notes b { color:var(--fg) }
+  .gap { border-left:4px solid var(--bad); background:var(--panel); border-radius:8px;
+         padding:10px 14px; margin-top:12px; max-width:90ch }
+  .legend { display:flex; flex-wrap:wrap; gap:6px 16px; font-size:13px; margin-top:6px }
+</style>
+</head>
+<body>
+<main>
+<h1>Lele architecture</h1>
+<p class="sub">A Rust workspace: a zero-domain micro-kernel, pure port contracts, independent
+packages, and one TUI frontend that is also the composition root. Surface from
+<code>contracts.inspect</code>; wiring from <code>crates/frontends/lrs/src/backend/local.rs</code>.</p>
+<div class="legend">
+  <span class="contract">■ contracts</span><span class="runtime">■ runtime</span>
+  <span class="core">■ core/*</span><span class="pkg">■ packages/*</span>
+  <span class="support">■ support/*</span><span class="front">■ frontends</span>
+</div>
+<nav>
+  <a href="#crates">1 · Crates</a><a href="#deps">2 · Dependency rules</a>
+  <a href="#startup">3 · Startup wiring</a><a href="#turn">4 · One turn</a>
+  <a href="#input">5 · Keyboard and paste</a><a href="#gaps">6 · Known gaps</a>
+</nav>
+
+<h2 id="crates">1 · Crates</h2>
+<p class="sub">Each box is a crate. Every package depends only on <code>protocol</code> and <code>sdk</code>
+(plus <code>support/*</code>); <code>lrs</code> is the only crate that sees packages.</p>
+<div class="grid">
+  <div class="card contract"><b>contracts/protocol</b><small>Pure serde data: RunRequest · Event · SessionMessage · ToolCall · Role · SessionRow · CommandSpec · WidgetRow</small></div>
+  <div class="card contract"><b>contracts/sdk</b><small>Port traits only: ModelGateway · AgentRunner · Tool · ToolExecutor · SessionStore · SecretVault · ConfigStore · FsPort · FunctionPlugin · Ctx · <code>service_keys</code></small></div>
+  <div class="card runtime"><b>runtime</b><small>Registry · JobManager · EventBus · CommandBus · WidgetBus · LoaderCtx (DI store) · RuntimeBuilder</small></div>
+  <div class="card core"><b>core/session</b><small>SqliteSessionStore (WAL, FTS5 recall) · InMemorySessionStore · /recall</small></div>
+  <div class="card core"><b>core/tool-executor-native · ptc</b><small>native: every tool offered, dispatched by name · ptc: one <code>run_js</code> tool, QuickJS</small></div>
+  <div class="card core"><b>core/tool-permission</b><small>The permission closure every executor calls before a tool runs</small></div>
+  <div class="card core"><b>core/tools · system-prompt · scope</b><small>read_file · write_file · edit_file (via FsPort) · system prompt · scope</small></div>
+  <div class="card core"><b>core/agent-tool-presentation · agent-default-model</b><small>Model-facing rendering of results (24 000-char cap) · default model</small></div>
+  <div class="card pkg"><b>packages/gateway</b><small>Multi-provider ModelGateway over ureq: OpenRouter · OpenAI · Anthropic · llama.cpp; SSE parsing; /model, /connect</small></div>
+  <div class="card pkg"><b>packages/runner-react</b><small>ReactLoopAgent: the ReAct loop that implements AgentRunner</small></div>
+  <div class="card pkg"><b>packages/tool-shell</b><small><code>bash</code> tool: Git Bash | PowerShell | sh, process-tree kill on cancel/timeout</small></div>
+  <div class="card support"><b>support/tool-schema</b><small>Argument validation and TS declarations for run_js. No workspace deps.</small></div>
+  <div class="card front"><b>frontends/lrs</b><small>ratatui TUI + composition root. LocalBackend (in-process runtime, default) or HttpBackend (legacy <code>lele serve</code>)</small></div>
+</div>
+
+<h2 id="deps">2 · Dependency rules</h2>
+<p class="sub">Solid arrows are allowed dependencies. Enforced by <code>check-architecture.sh</code> (C1–C4, S1, K, E).</p>
+<div class="panel"><pre class="mermaid">
+flowchart BT
+  protocol["contracts/protocol"]:::contract
+  sdk["contracts/sdk"]:::contract
+  runtime["runtime"]:::runtime
+  core["core/* (9 crates)"]:::core
+  pkgs["packages/* (gateway, runner-react, tool-shell)"]:::pkg
+  support["support/tool-schema"]:::support
+  lrs["frontends/lrs (composition root)"]:::front
+
+  sdk --> protocol
+  runtime --> sdk
+  runtime --> protocol
+  core --> sdk
+  core --> support
+  pkgs --> sdk
+  lrs -->|"always"| sdk
+  lrs -->|"local-runtime"| runtime
+  lrs -->|"local-runtime"| core
+  lrs -->|"local-runtime"| pkgs
+
+  classDef contract stroke:#58a6ff,stroke-width:2px
+  classDef runtime stroke:#bc8cff,stroke-width:2px
+  classDef core stroke:#3fb950,stroke-width:2px
+  classDef pkg stroke:#d29922,stroke-width:2px
+  classDef support stroke:#8b949e,stroke-width:2px
+  classDef front stroke:#f778ba,stroke-width:2px
+</pre></div>
+<div class="panel">
+<table>
+<tr><th>crate</th><th></th><th>may depend on</th><th>never on</th></tr>
+<tr><td>protocol</td><td class="ok">→</td><td>(nothing in the workspace)</td><td class="no">sdk</td></tr>
+<tr><td>sdk</td><td class="ok">→</td><td>protocol</td><td></td></tr>
+<tr><td>runtime</td><td class="ok">→</td><td>protocol, sdk</td><td class="no">core/*, packages/*, lrs</td></tr>
+<tr><td>core/*, packages/*</td><td class="ok">→</td><td>protocol, sdk, support/*, own technical crates</td><td class="no">runtime, lrs, any sibling in core/* or packages/*</td></tr>
+<tr><td>support/*</td><td class="ok">→</td><td>external crates only</td><td class="no">every workspace crate</td></tr>
+<tr><td>lrs</td><td class="ok">→</td><td>protocol, sdk, ureq <span class="mono">[legacy-http]</span>; runtime, core/*, packages/* <span class="mono">[local-runtime]</span></td><td></td></tr>
+</table>
+<p class="sub" style="margin-top:10px">Features: <code>default = local-runtime, legacy-http</code>. <code>--backend local</code> is the default.</p>
+</div>
+
+<h2 id="startup">3 · Startup wiring</h2>
+<p class="sub">How <code>LocalBackend::new</code> assembles the runtime. Packages never construct each other:
+each plugin's <code>apply</code> pulls host services out of the DI store by <code>sdk::service_keys</code>
+and registers contributions as RAII effects, checked against its <code>plugin.toml</code>.</p>
+<div class="panel"><pre class="mermaid">
+flowchart LR
+  subgraph host["lrs · LocalBackend::new"]
+    fs["LocalFs<br/>(confined to project dir)"]
+    store["FileStore<br/>~/.lele/lrs-store.toml"]
+    db["SqliteSessionStore<br/>~/.lele/lrs/sessions.db"]
+  end
+  subgraph builder["RuntimeBuilder"]
+    di["DI store<br/>secrets · config · fs · sessions"]
+    plugins["plugins: gateway · runner-react · tool-permission<br/>tool-executor-native · tool-executor-ptc · tools<br/>tool-shell · system-prompt · agent-tool-presentation<br/>session-recall"]
+  end
+  subgraph reg["runtime::Registry"]
+    gw["active gateway"]
+    run["active runner"]
+    exec["executors: native, ptc"]
+    tools["tools"]
+    svc["services: permission,<br/>presentation, system prompt"]
+    cmds["slash commands"]
+  end
+
+  store -->|"SecretVault + ConfigStore"| di
+  fs --> di
+  db --> di
+  plugins -->|"apply(ctx): ctx.get(service_key)"| di
+  plugins -->|"ctx.effect(Contribution) → RegistrationHandle"| reg
+  reg --> jm["JobManager<br/>(executor from --executor, default ptc)"]
+</pre></div>
+
+<h2 id="turn">4 · One turn, end to end</h2>
+<p class="sub">From pressing enter to the answer on screen, local backend. The runtime holds no agent
+logic: it resolves ports, persists, and relays events.</p>
+<div class="panel"><pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as User
+  participant App as lrs App
+  participant LB as LocalBackend
+  participant JM as JobManager
+  participant SS as SessionStore
+  participant R as Runner (react)
+  participant GW as ModelGateway
+  participant EX as ToolExecutor
+  participant P as Permission
+
+  U->>App: enter
+  App->>App: expand paste chips, echo prompt
+  App->>LB: start_run(RunRequest)
+  LB->>JM: start_run(session, cwd, text, model, effort)
+  JM->>JM: resolve runner, gateway, executor, permission, presentation
+  JM->>SS: push(User, text)
+  JM->>SS: history(session)
+  JM-->>LB: job_id (turn runs on its own thread)
+  LB-->>App: RunResponse
+  App->>LB: stream_events(job_id)
+  loop until the model stops calling tools
+    R->>GW: stream(model, system + history, tool definitions)
+    GW-->>R: Chunk: TextDelta / Thinking / ToolCallChunk / Usage / Done
+    R-->>App: Event::TextDelta (live tokens)
+    opt tool calls
+      R->>EX: dispatch(call, args)
+      EX->>P: permission(tool, args)
+      P-->>EX: allow / deny
+      EX-->>R: ToolOutput (rendered by presentation for the model)
+    end
+    R->>JM: Event::MessageAdded (assistant, tool results, steers)
+    JM->>SS: append(message) via RecordingSink
+  end
+  JM-->>App: Event::JobFinished / JobFailed
+</pre></div>
+<ol class="notes">
+  <li><b>Fail closed.</b> No permission policy registered means no turn starts; no presentation means no turn starts.</li>
+  <li><b>Persist then forward.</b> <code>RecordingSink</code> stores each <code>MessageAdded</code> before clients see it, so the next turn replays exactly what the model saw.</li>
+  <li><b>Steering.</b> Text typed mid-turn goes to <code>TurnController::steer</code>; the runner injects it at a safe point.</li>
+</ol>
+
+<h2 id="input">5 · Keyboard and paste</h2>
+<p class="sub">The Windows console has no bracketed paste: a paste arrives as one key event per character,
+newlines as enter. The loop drains everything queued every 30 ms and decides per batch.
+<b>Step ② is today's fix:</b> mouse moves landing between pasted characters used to make the batch
+"not text", so every pasted newline ran as enter and each line was sent as its own message.</p>
+<div class="panel"><pre class="mermaid">
+flowchart TD
+  rd["reader thread<br/>crossterm event::read()"] --> ch[["channel"]]
+  ch --> poll["poll: drain up to 4096 events"]
+  poll -->|"nothing for 30 ms"| flush{"flush_keys:<br/>held text settled?"}
+  poll --> inert["② drop inert events<br/>mouse moves · focus · resize"]
+  inert -->|"batch now empty"| flush
+  inert --> txt{"① printable_text:<br/>only chars, plain enter/tab?"}
+  txt -->|"yes"| buf["hold in key_buf<br/>(timestamped)"]
+  buf --> flush
+  txt -->|"no: chord, arrow, click, Paste"| force["force_flush held text,<br/>then handle each event"]
+  flush -->|"typing: next tick<br/>paste: 120 ms quiet"| force
+  force --> lp{"looks_pasted?<br/>≥8 chars or newline mid-text"}
+  lp -->|"yes"| paste["paste(): CRLF/CR → LF<br/>image paths → attachments<br/>long text → [Pasted N lines] chip"]
+  lp -->|"no"| typed["replay as keystrokes<br/>(enter sends)"]
+</pre></div>
+<ol class="notes">
+  <li><b>AltGr is text.</b> Italian layouts encode <code>{ } [ ] @ #</code> as ctrl+alt; only ctrl without alt counts as a chord.</li>
+  <li><b>Images.</b> <code>^p</code> (and <code>^v</code> where the terminal lets it through) reads the clipboard image via <code>arboard</code>; a pasted file path or <code>file://</code> URL becomes an <code>[Image #N]</code> chip.</li>
+  <li><b>Panic safety.</b> A panic on the main thread now restores the terminal (raw mode, mouse capture, alternate screen) before the message prints.</li>
+</ol>
+
+<h2 id="gaps">6 · Known gaps</h2>
+<div class="gap"><b>Images stop at the local backend.</b> The app builds OpenAI-style content parts, but
+<code>LocalBackend::start_run</code> accepts text only, <code>SessionMessage</code> has no attachment field,
+and the gateway sends <code>content</code> as a string. <code>protocol::RunRequest.images</code> is unused.
+Images work only with <code>--backend http</code>.</div>
+<div class="gap"><b>Direct Anthropic provider format.</b> The <code>anthropic</code> endpoint posts an Anthropic-format body to
+<code>/chat/completions</code> with a Bearer header, and its stream parser ignores <code>tool_use</code> blocks.
+An <code>anthropic/…</code> model works only through OpenRouter, that is, while no direct <code>anthropic</code> key is connected.</div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  (function () {
+    var forced = document.documentElement.getAttribute('data-theme');
+    var dark = forced ? forced === 'dark'
+      : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    mermaid.initialize({ startOnLoad: true, theme: dark ? 'dark' : 'default', securityLevel: 'strict',
+                         flowchart: { htmlLabels: true }, sequence: { mirrorActors: false } });
+  })();
+</script>
+</body>
+</html>

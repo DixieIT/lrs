@@ -1,0 +1,9 @@
+[package]
+name = "tool-schema"
+description = "JSON Schema validation and TypeScript rendering for tool arguments. No domain, no workspace dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }

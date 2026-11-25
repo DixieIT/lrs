@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/contracts/protocol",
+    "crates/contracts/sdk",
+    "crates/runtime",
+    "crates/core/agent-default-model",
+    "crates/core/agent-tool-presentation",
+    "crates/core/system-prompt",
+    "crates/core/tool-executor-native",
+    "crates/core/tool-executor-ptc",
+    "crates/core/tool-permission",
+    "crates/core/tools",
+    "crates/core/scope",
+    "crates/core/session",
+    "crates/packages/gateway",
+    "crates/packages/runner-react",
+    "crates/packages/tool-shell",
+    "crates/support/tool-schema",
+    "crates/frontends/lrs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.4"
+thiserror = "2"
+tracing = "0.1"
+ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
+
+# Path dependencies — the only way crates may depend on each other.
+protocol = { path = "crates/contracts/protocol" }
+sdk = { path = "crates/contracts/sdk" }
+runtime = { path = "crates/runtime" }
+runner-react = { path = "crates/packages/runner-react" }
+agent-default-model = { path = "crates/core/agent-default-model" }
+agent-tool-presentation = { path = "crates/core/agent-tool-presentation" }
+system-prompt = { path = "crates/core/system-prompt" }
+tool-executor-native = { path = "crates/core/tool-executor-native" }
+tool-executor-ptc = { path = "crates/core/tool-executor-ptc" }
+tool-permission = { path = "crates/core/tool-permission" }
+tools = { path = "crates/core/tools" }
+scope = { path = "crates/core/scope" }
+session = { path = "crates/core/session" }
+gateway = { path = "crates/packages/gateway" }
+tool-shell = { path = "crates/packages/tool-shell" }
+# Technical support crates: no domain and no workspace dependencies of their own.
+tool-schema = { path = "crates/support/tool-schema" }
+

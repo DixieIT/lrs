@@ -1,0 +1,8 @@
+id = "session"
+name = "session"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "command"
+name = "recall"

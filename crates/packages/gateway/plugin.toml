@@ -1,0 +1,16 @@
+id = "gateway"
+name = "gateway"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "gateway"
+name = "gateway"
+
+[[registrations]]
+kind = "command"
+name = "model"
+
+[[registrations]]
+kind = "command"
+name = "connect"

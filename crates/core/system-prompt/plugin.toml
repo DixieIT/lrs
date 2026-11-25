@@ -1,0 +1,8 @@
+id = "system-prompt"
+name = "system-prompt"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "service"
+name = "system-prompt"

@@ -1,0 +1,12 @@
+[package]
+name = "tool-shell"
+description = "The `bash` tool: one shell command per call, process tree killed on cancel or timeout."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+protocol = { workspace = true }
+sdk = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,19 @@
+name = "catppuccin-mocha"
+
+bg = "none"
+
+fg       = "#cdd6f4"
+muted    = "#6c7086"
+accent   = "#89b4fa"
+border   = "#313244"
+
+user     = "#89dceb"
+tool     = "#cba6f7"
+thinking = "#a6e3a1"
+
+ok       = "#a6e3a1"
+warn     = "#f9e2af"
+err      = "#f38ba8"
+
+add      = "#a6e3a1"
+del      = "#f38ba8"

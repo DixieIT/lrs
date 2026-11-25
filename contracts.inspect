@@ -1,0 +1,787 @@
+# contracts.inspect — generated view of the system surface.
+
+# No behaviour. Only types, signatures, edges and rules.
+
+# Validate with: ./check-architecture.sh
+
+[workspace]
+
+crate  contracts/protocol       -> lib     [crates/contracts/protocol/Cargo.toml]
+
+crate  contracts/sdk            -> lib     [crates/contracts/sdk/Cargo.toml]
+
+crate  runtime                  -> lib     [crates/runtime/Cargo.toml]
+
+crate  frontends/lrs                 -> bin(lrs) [crates/frontends/lrs/Cargo.toml]
+
+dir    crates/core/                   -> 9 foundational sdk packages
+dir    crates/packages/               -> optional sdk packages (gateway, mcp, skills, …)
+
+dir    crates/support/                -> technical crates: no domain, no workspace dependencies
+
+[source]
+
+protocol   -> crates/contracts/protocol/src/lib.rs
+
+sdk        -> crates/contracts/sdk/src/*.rs
+
+runtime    -> crates/runtime/src/*.rs
+
+lrs             -> crates/frontends/lrs/src/main.rs
+
+[edges.allowed]
+
+protocol                        -> (none)
+
+sdk                             -> protocol
+
+runtime                         -> protocol, sdk
+
+core/*                               -> protocol, sdk, <own technical crates>, support/*
+
+packages/*                           -> protocol, sdk, <own technical crates>, support/*
+
+support/*                            -> (no workspace crate)
+
+lrs                                  -> protocol, sdk, [ureq]                  (legacy-http)
+                                        runtime, core/*, packages/*            (local-runtime)
+;; lrs is the composition root: the only crate allowed to depend on packages
+
+[edges.forbidden]
+
+core/*                               -X core/*, packages/*, runtime, lrs
+
+packages/*                           -X packages/*
+
+packages/*                           -X core/*
+
+support/*                            -X protocol, sdk, runtime, packages/*, support/*, lrs
+
+packages/*                           -X runtime
+
+packages/*                           -X lrs
+
+runtime                         -X core/*, packages/*
+
+runtime                         -X lrs
+
+protocol                        -X sdk
+
+[features.lrs]
+
+default                              = local-runtime, legacy-http
+
+legacy-http                          -> ureq
+
+local-runtime                        -> runtime, gateway, runner-react, tool-executor-native,
+                                        tool-executor-ptc, tool-permission, tools, tool-shell,
+                                        system-prompt, agent-tool-presentation, session
+
+;; ---------------------------------------------------------------------------
+
+;; contracts/protocol
+
+;; ---------------------------------------------------------------------------
+
+[module protocol]
+
+struct RunRequest {
+
+    session_id   : String
+
+    cwd          : String
+
+    text         : String
+
+    model        : Option<String>
+
+    effort       : Option<String>
+
+    images       : Vec<ImagePart>
+
+}
+
+struct ImagePart          { media_type : String, data : String }
+
+struct RunResponse        { session_id : String, job_id : String }
+
+enum Event {
+
+    TextDelta         { text : String }
+
+    Thinking          { text : String }
+
+    ToolCallStart     { id : String, name : String, args : Value }
+
+    ToolCallEnd       { id : String, output : String, failed : bool }
+
+    WidgetUpdated     { widget : WidgetRow }
+
+    JobFinished       { session_id : String, job_id : String }
+
+    JobFailed         { session_id : String, job_id : String, error : String }
+
+    ApprovalRequired  { id : String, description : String }
+
+    Steered           { text : String }
+    MessageAdded      { message : SessionMessage }   ;; every message a turn adds; the runtime persists it
+
+    Usage             { input_tokens : u64, output_tokens : u64, context_limit : u64 }
+
+    Heartbeat
+
+}
+
+struct SessionRow    { id, cwd : String, title : Option<String>, created_at, updated_at : i64,
+                       message_count : u64 }   ;; serde(default); times in Unix ms
+
+struct SessionMessage{ id, role : Role, content : String, created_at : i64,
+                       tool_calls : Vec<ToolCall> }   ;; serde(default); Tool: id = answered call
+struct ToolCall      { id, name, arguments : String }  ;; arguments: raw JSON text from the model
+
+enum  Role           { User | Assistant | System | Tool }
+
+struct CommandSpec   { name, description : String, args_schema : Option<Value>,
+
+                       subcommands : Vec<String>, owner : Option<String> }
+
+struct CommandResult { text : String, session_id : Option<String> }
+
+struct WidgetRow     { session_id, id, title, body : String }
+
+struct PluginDescriptor { id, name, version, category : String, enabled : bool }
+
+;; ---------------------------------------------------------------------------
+
+;; contracts/sdk
+
+;; ---------------------------------------------------------------------------
+
+[module sdk]
+
+type Result<T> = std::result::Result<T, Error>
+
+enum Error {
+
+    AuthRequired    { provider : String }
+
+    Cancelled
+
+    Timeout         { limit_ms : u64 }
+
+    PermissionDenied(String)
+
+    RateLimited     { provider : String, retry_after : Option<u64> }
+
+    InvalidInput(String)
+
+    Unavailable(String)
+
+    Internal(String)
+
+}
+
+[sdk.service_keys]
+TOOL_PRESENTATION = "agent-tool-presentation"
+DEFAULT_MODEL     = "agent-default-model"
+SYSTEM_PROMPT     = "system-prompt"
+SCOPE             = "scope"
+SESSION           = "session"
+NATIVE_EXECUTOR   = "native"
+PTC_EXECUTOR      = "ptc"
+TOOLS             = "tools"
+TOOL_PERMISSION   = "tool-permission"   ;; service: Arc<PermissionCheck>
+REACT_RUNNER      = "react"
+;; no inline service-name strings in runtime or packages
+
+;; --- 1. resolver manifest + topology ---------------------------------------
+
+enum PluginForm              { service | function }
+
+enum RegistrationDecl {
+
+    Service    { name : String }
+
+    Tool       { name : String }
+
+    Command    { name : String }
+
+    Widget     { id   : String }
+
+    Capability { name : String }
+
+    Mcp        { name : String }
+    Skill      { name : String }
+    Hook       { event : String }
+
+    Gateway    { name : String }
+
+    Runner     { name : String }
+
+}
+
+struct ResolverManifest {
+
+    id, name, version : String
+
+    form              : PluginForm
+
+    registrations     : Vec<RegistrationDecl>
+
+    config_schema     : Option<Value>
+
+}
+
+trait PluginManifest { fn manifest() -> ResolverManifest }
+
+struct Config(pub Value)
+
+fn Config::new(Value) -> Config
+
+fn Config::get(&self, &str) -> Option<&Value>
+
+struct RegistrationHandle
+
+fn RegistrationHandle::new(impl FnOnce() + Send + Sync) -> RegistrationHandle
+
+fn RegistrationHandle::none() -> RegistrationHandle
+
+impl Drop for RegistrationHandle          ; undo on drop
+
+struct Disposer { handles : Vec<RegistrationHandle> }
+
+fn Disposer::push(&mut self, RegistrationHandle)
+
+fn Disposer::add(&mut self, impl IntoIterator<Item=RegistrationHandle>)
+
+;; registrations are effects, never direct struct mutation
+
+enum Contribution {
+    Service    { name : String, service : Arc<dyn Any+Send+Sync> }
+    Tool       { tool : Box<dyn Tool> }
+    Command    { handler : Box<dyn SlashCommandHandler> }   ;; spec from handler.spec()
+    Widget     { widget : WidgetRow }
+    Capability { capability : Box<dyn Capability> }
+    Hook       { event : &'static str, handler : Box<dyn Fn(&dyn Any)+Send+Sync> }
+    Mcp        { provider : Box<dyn McpProvider> }
+    Skill      { provider : Box<dyn SkillProvider> }
+    Gateway    { gateway : Box<dyn ModelGateway> }
+    Runner     { runner : Box<dyn AgentRunner> }
+}
+
+trait Ctx : Send + Sync {
+
+    effect   (&mut self, Contribution) -> Result<RegistrationHandle>
+
+    on       (&mut self, &'static str, Box<dyn Fn(&dyn Any)+Send+Sync>)
+
+                                                    -> Result<RegistrationHandle>
+
+    get      (&self, name : &str) -> Option<Arc<dyn Any+Send+Sync>>
+
+    declared (&self, name : &str) -> Arc<dyn Any+Send+Sync>
+
+}
+
+trait EffectStore : Send + Sync {
+    apply     (&self, plugin_id : &str, Contribution) -> Result<RegistrationHandle>
+
+    subscribe (&self, plugin_id : &str, &'static str, Box<dyn Fn(&dyn Any)+Send+Sync>) -> Result<RegistrationHandle>
+
+
+}
+
+struct InjectCtx<'a>
+
+fn InjectCtx::inject(&mut self, &'a str) -> Arc<dyn Any+Send+Sync>
+
+fn InjectCtx::declare(&mut self, &'a str, Value)
+
+fn InjectCtx::injections(&self) -> &[&'a str]
+
+;; two mutually exclusive package forms — mixing makes Loader discard namespace
+
+trait Service : PluginManifest + Send + Sync {
+
+    fn build(config : &Config, ctx : &InjectCtx) -> Result<Self>
+
+}
+
+trait FunctionPlugin : Send + Sync {
+
+    fn name          (&self) -> &str
+
+    fn registrations (&self) -> Vec<RegistrationDecl>
+
+    fn apply         (&self, &Config, &mut dyn Ctx) -> Result<Disposer>
+
+}
+
+[module sdk::command]
+
+struct CommandContext { arg, session_id, cwd : String }
+trait SlashCommandHandler : Send + Sync {
+    spec    (&self) -> CommandSpec
+    execute (&self, &CommandContext) -> Result<CommandResult>
+}
+;; CommandSpec is metadata only. Execution requires a handler contributed
+;; with the spec via ctx.effect(); no placeholder text is ever returned.
+
+;; --- 2. six domain ports ---------------------------------------------------
+
+struct ProviderInfo { id, name, base_url : String, configured : bool }
+
+struct ModelInfo    { id, provider : String, context_limit : u64 }
+
+enum  Chunk         { TextDelta(String) | Thinking(String)
+
+                    | ToolCallChunk{id,name:Option<String>,arguments_delta:String}
+
+                    | Usage{input_tokens:u64,output_tokens:u64} | Done }
+
+type  Stream        = Box<dyn Iterator<Item = Result<Chunk>> + Send>
+
+trait ModelGateway : Send + Sync {
+
+    providers     (&self) -> Result<Vec<ProviderInfo>>
+
+    models        (&self) -> Result<Vec<ModelInfo>>
+
+    connect       (&mut self, provider : &str, key : &str) -> Result<()>
+
+    default_model (&self) -> Option<String>
+
+    stream        (&self, model : &str, messages : &[SessionMessage],
+
+                   tools : &[Value]) -> Result<Stream>
+
+}
+
+struct TurnContext<'a> {
+
+    session_id : &'a str
+
+    cwd        : &'a str
+
+    history    : &'a [SessionMessage]
+
+    gateway    : &'a dyn ModelGateway
+
+    tools      : &'a [&'a dyn Tool]
+
+    model      : Option<&'a str>
+
+    effort     : Option<&'a str>
+
+    controller : Arc<dyn TurnControl>
+    executor   : &'a dyn ToolExecutor
+    permission : &'a PermissionCheck      ;; resolved by the runtime; runner builds none
+    presentation : &'a dyn ToolPresentation ;; render_result on every result the model receives
+    tool_context : ToolContext
+
+}
+
+trait TurnControl : Send + Sync {
+
+    is_cancelled (&self) -> bool
+
+    take_steers  (&self) -> Vec<String>
+
+}
+
+;; a runner emits MessageAdded for every message it adds (assistant text and tool
+;; requests, tool results as rendered for the model, steers); it never stores anything
+trait AgentRunner : Send + Sync {
+
+    run (&self, &TurnContext<'_>, &dyn EventSink) -> Result<()>
+
+}
+
+struct ToolOutput { content : String, is_error : bool }
+
+fn ToolOutput::ok(String) -> ToolOutput
+
+fn ToolOutput::err(String) -> ToolOutput
+
+struct ToolContext {
+
+    session_id        : String
+
+    cwd               : String
+
+    cancellation_token: Arc<dyn Fn() -> bool + Send + Sync>
+
+    fs                : Arc<dyn FsPort>
+
+}
+
+fn ToolContext::is_cancelled(&self) -> bool
+
+trait Tool : Send + Sync {
+
+    name              (&self) -> &str
+
+    description       (&self) -> &str
+
+    parameters_schema (&self) -> Value
+
+    execute           (&self, Value, &ToolContext) -> Result<ToolOutput>
+
+}
+
+struct SkillDescriptor { name, description, source : String }
+
+trait SkillProvider : Send + Sync {
+
+    discover (&self, cwd : &str) -> Result<Vec<SkillDescriptor>>
+
+    load     (&self, &SkillDescriptor) -> Result<Box<dyn Capability>>
+
+}
+
+trait McpProvider : Send + Sync {
+
+    id         (&self) -> &str
+
+    connect    (&mut self, cwd : &str) -> Result<()>
+
+    disconnect (&mut self) -> Result<()>
+
+    capability (&self) -> Box<dyn Capability>
+
+}
+
+trait Capability : Send + Sync {
+
+    name            (&self) -> &str
+
+    instructions    (&self) -> &[String]
+
+    tools           (&self) -> Vec<Box<dyn Tool>>
+
+    on_session_start(&self, &str, &dyn EventSink) -> Result<()>
+
+    on_before_model (&self, &str, &dyn EventSink) -> Result<()>
+
+    on_after_tool   (&self, &str, &str, &dyn EventSink) -> Result<()>
+
+    on_turn_end     (&self, &str, &dyn EventSink) -> Result<()>
+
+    widgets         (&self) -> Option<&dyn WidgetSink>
+
+    config          (&self) -> Option<&dyn ConfigStore>
+
+}
+
+;; --- 3. sinks --------------------------------------------------------------
+
+trait EventSink   : Send + Sync { emit(&self, Event) }
+
+trait WidgetSink  : Send + Sync { upsert(&self, WidgetRow)
+
+                                  remove(&self, session_id : &str, widget_id : &str) }
+
+trait SecretVault : Send + Sync { get(&self, &str) -> Result<Option<String>>
+
+                                  set(&self, &str, &str) -> Result<()> }
+
+trait ConfigStore : Send + Sync { get(&self, &str) -> Result<Option<String>>
+
+                                  set(&self, &str, &str) -> Result<()> }
+
+trait FsPort      : Send + Sync { read(&self, &Path) -> Result<String>
+
+                                  write(&self, &Path, &str) -> Result<()>
+
+                                  list(&self, &Path) -> Result<Vec<String>> }
+;; implemented by the composition root (lrs: LocalFs, confined to the project)
+
+;; ---------------------------------------------------------------------------
+
+;; core/runtime — pure orchestration
+
+;; ---------------------------------------------------------------------------
+
+[module sdk::ports]
+
+struct Scope { cwd : String, session_id : String }
+trait ToolExecutor : Send + Sync {
+    name        (&self) -> &str
+    execute     (&self, &dyn Tool, Value, &ToolContext,
+                 permission : &PermissionCheck) -> Result<ToolOutput>
+    definitions (&self, tools : &[&dyn Tool]) -> Vec<Value>      ;; what the model is offered
+    dispatch    (&self, call : &str, Value, tools : &[&dyn Tool], &ToolContext,
+                 permission : &PermissionCheck) -> Result<ToolOutput>
+}
+;; native: offers every tool, dispatches by name
+;; ptc:    offers run_js; tools are tools.<name>(args) inside QuickJS (rquickjs =0.14.0),
+;;         each call decided by execute() on the caller's thread through `permission`;
+;;         run_js lists the tools as `declare const tools: {...}` (tool_schema::render_ts_declarations)
+;; both:   execute() = permission -> tool_schema::validate_args -> cancellation -> Tool::execute;
+;;         a schema mismatch is Ok(ToolOutput::err("invalid arguments for <tool>: ..."))
+type PermissionCheck = dyn Fn(&str,&Value) -> Result<()> + Send + Sync
+;; concrete PermissionPolicy + permission_closure live in crates/core/tool-permission
+;; enforcement lives in the deciding operation; no public check() to bypass
+
+trait ToolPresentation : Send + Sync {   ;; dyn port: Arc<dyn ToolPresentation> under TOOL_PRESENTATION
+    render_call       (&self, &str, &Value) -> String
+    render_result     (&self, &ToolOutput) -> String
+    render_diagnostic (&self, &Error) -> String
+}
+trait DefaultModel : Send + Sync {
+    resolve       (&self, &Scope, Option<&str>) -> Result<String>
+    context_limit (&self, &str) -> Result<u64>
+}
+trait SystemPrompt : Send + Sync { compose(&self, &Scope, &[String]) -> String }
+trait Tools : Send + Sync        { active(&self, &Scope) -> Vec<&dyn Tool> }
+trait SessionStore : Send + Sync {
+    create  (&self, &str) -> Result<SessionRow>
+    push    (&self, &str, Role, String) -> Result<()>
+    append  (&self, &str, SessionMessage) -> Result<()>   ;; keeps tool_calls and a tool result's call id
+    history (&self, &str) -> Result<Vec<SessionMessage>>
+    list    (&self, Option<&str>) -> Result<Vec<SessionRow>>
+}
+
+[core.topology]
+core/agent/
+  ;; concrete runner moved to packages/agent-loop (see below)
+  core/agent/default-model/      -> Service   AgentDefaultModel
+  core/agent/tool-permission/    -> closure   permission_closure()   (no public service)
+  core/agent/tool-presentation/  -> plugin    AgentToolPresentation  (model-facing; results capped at 24 000 chars,
+                                            head + tail around an exact notice; never applied inside run_js)
+core/scope/                      -> Service   Scope
+core/session/                    -> SqliteSessionStore (durable, WAL, FTS5) | InMemorySessionStore (tests);
+                                   SessionRecallPlugin: /recall <words> (FTS5 over user messages and answers);
+                                   ids YYYYMMDD-HHMMSS-<rand>, title from the first user message
+core/system-prompt/              -> Service   SystemPrompt: "You are Lele
+Working directory: <Scope.cwd>" (Service{name="system-prompt"})
+core/tools/                      -> plugin    ToolsPlugin: read_file (offset/limit), write_file, edit_file (via FsPort)
+core/tool-executor-ptc/          -> plugin    PtcExecutorPlugin: Service{name="ptc"} (Arc<dyn ToolExecutor>)
+core/tool-permission/            -> plugin    PermissionPlugin: Service{name="tool-permission"}
+
+[packages.concrete]
+packages/agent-loop/             -> ReactLoopAgent implements sdk::AgentRunner
+                                   uses TurnContext::executor (definitions/dispatch) + TurnContext::permission
+packages/tool-shell/             -> Bash implements sdk::Tool ("bash"); ToolShellPlugin
+                                   shell chosen once: Git Bash (next to git on PATH) | PowerShell | sh;
+                                   own process group; tree killed on cancel (Err(Cancelled)) or timeout;
+                                   timeout_ms default 120000, max 600000; ANSI stripped; no size cap here
+packages/tool-executor-native/   -> ToolExecutorNative implements sdk::ToolExecutor
+                                   FunctionPlugin: registers Service{name="native"}
+;; core holds no concrete runner or tool-executor
+
+[core.edges]
+agent/loop/agent.rs  -> Phase(idle|maintenance|running), InboxState, Abort,
+                        ToolCallRecovery, PreparedStep, LlmCallConfig
+                        send/followup/steer/inject/cancel/wake_driver/turn/step
+                        turn/step events: start, end, request/header, assistant/attempt
+tools                -> tool-executor-native | tool-executor-ptc   (same seam)
+tool-executor-*      <- agent/tool-permission (closure passed in, not a wrapper)
+
+[module session]
+;; crates/core/session — concrete sdk::ports::SessionStore implementations
+
+struct SqliteSessionStore        ;; one database, ~/.lele/lrs/sessions.db in lrs
+
+fn SqliteSessionStore::open(path : &Path) -> Result<Self>
+
+fn SqliteSessionStore::search(&self, query : &str, limit : usize) -> Result<Vec<Recall>>
+
+impl SessionStore for SqliteSessionStore
+
+struct InMemorySessionStore
+
+impl SessionStore for InMemorySessionStore
+
+struct Recall { session_id, title, cwd : String, role : Role, snippet : String, updated_at : i64 }
+
+[module runtime]
+
+struct Runtime {
+
+    registry : Arc<Registry>
+
+    sessions : Arc<SessionStore>
+
+    jobs     : Arc<JobManager>
+
+    commands : Arc<CommandBus>
+
+    widgets  : Arc<WidgetBus>
+
+    disposers: Vec<Disposer>
+
+    plugins  : Vec<Box<dyn FunctionPlugin>>
+
+}
+
+fn Runtime::builder() -> RuntimeBuilder
+
+fn Runtime::plugin_manifests() -> Vec<ResolverManifest>
+
+fn Runtime::reload(&mut self, &Config) -> Result<()>
+
+struct RuntimeBuilder { plugins : Vec<Box<dyn FunctionPlugin>>,
+
+                            service_manifests : Vec<ResolverManifest> }
+
+fn RuntimeBuilder::new() -> Self
+
+fn RuntimeBuilder::with_plugin(self, Box<dyn FunctionPlugin>) -> Self
+
+fn RuntimeBuilder::with_service<M: PluginManifest>(self) -> Self
+
+fn RuntimeBuilder::with_fs(self, Arc<dyn FsPort>) -> Self
+
+fn RuntimeBuilder::with_executor(self, key : impl Into<String>) -> Self   ;; default "native"
+
+fn RuntimeBuilder::build(self) -> Result<Runtime>
+
+struct Registry {
+
+    tools        : RwLock<Vec<Arc<dyn Tool>>>
+
+    commands     : RwLock<Vec<CommandSpec>>
+
+    widgets      : RwLock<Vec<WidgetRow>>
+
+    gateways     : RwLock<Vec<Arc<dyn ModelGateway>>>
+
+    runners      : RwLock<Vec<Arc<dyn AgentRunner>>>
+
+    mcp          : RwLock<Vec<Arc<dyn McpProvider>>>
+
+    skills       : RwLock<Vec<Arc<dyn SkillProvider>>>
+
+    capabilities : RwLock<Vec<Arc<dyn Capability>>>
+
+    services     : RwLock<HashMap<String, Arc<dyn Any+Send+Sync>>>
+
+    hooks        : RwLock<HashMap<&'static str, Vec<Arc<dyn Fn(&dyn Any)+Send+Sync>>>>
+
+}
+
+fn    Registry::declare(&self, ResolverManifest)
+
+fn    Registry::manifests(&self) -> Vec<ResolverManifest>
+
+fn    Registry::executor(key : &str) -> Option<Arc<dyn ToolExecutor>>
+
+fn    Registry::permission() -> Option<Arc<PermissionCheck>>
+
+fn    Registry::system_prompt() -> Option<Arc<dyn SystemPrompt>>
+
+fn    Registry::presentation() -> Option<Arc<dyn ToolPresentation>>   ;; required by start_run
+
+fn    Registry::active_runner() -> Option<Arc<dyn AgentRunner>>
+
+fn    Registry::active_gateway() -> Option<Arc<dyn ModelGateway>>
+
+struct LoaderCtx { registry : Arc<Registry>,
+
+                   injections : HashMap<String, Arc<dyn Any+Send+Sync>> }
+
+impl Ctx for LoaderCtx
+
+;; sessions: runtime holds an Arc<dyn sdk::ports::SessionStore>; the concrete
+;; stores live in core/session — see [module session]
+
+struct TurnController
+
+fn TurnController::cancel(&self)
+
+fn TurnController::steer(&self, String)
+
+fn TurnController::handle(&self) -> Arc<dyn TurnControl + Send + Sync>
+
+struct EventBus
+
+impl EventSink for EventBus
+
+fn EventBus::subscribe(&self, impl Fn(Event) + Send + Sync + 'static)
+
+struct JobManager
+
+fn JobManager::events(&self) -> Arc<EventBus>
+
+fn JobManager::job_events(&self, job_id : &str) -> Option<Arc<EventBus>>
+
+fn JobManager::forget(&self, job_id : &str)
+
+fn JobManager::select_executor(&self, key : &str) -> Result<()>   ;; must be registered
+
+fn JobManager::executor(&self) -> Result<(String, Arc<dyn ToolExecutor>)>
+
+fn JobManager::preview(&self, session_id : &str, cwd : &str) -> Result<TurnPreview>   ;; what the next turn hands the model:
+;; system prompt (Registry::system_prompt, composed per turn, never stored) + session history
+
+struct TurnPreview { model : Option<String>, executor : String, system : Vec<String>,
+                     tools : Vec<Value>, history : Vec<SessionMessage> }
+
+fn CommandBus::with_builtin(self, Arc<dyn SlashCommandHandler>) -> Self    ;; built-ins win over packages
+
+struct ContextCommand                       ;; built-in `/context`: renders JobManager::preview verbatim
+
+fn JobManager::control(&self, job_id : &str) -> Option<TurnController>
+
+fn JobManager::start_run(&self, session_id : &str, cwd : &str, text : &str,
+
+                         model : Option<&str>, effort : Option<&str>) -> Result<String>
+
+struct CommandBus
+
+fn CommandBus::specs(&self) -> Vec<CommandSpec>
+
+fn CommandBus::dispatch(&self, input : &str, session_id : &str, cwd : &str) -> Option<Result<CommandResult>>
+
+struct WidgetBus
+
+impl WidgetSink for WidgetBus
+
+fn WidgetBus::for_session(&self, session_id : &str) -> Vec<WidgetRow>
+
+;; ---------------------------------------------------------------------------
+
+;; frontends/lrs — composition root only
+
+;; ---------------------------------------------------------------------------
+
+[module lrs]
+
+bin            lrs
+
+features       default = local-runtime, legacy-http
+
+mod            app, net, theme, ui
+
+backend        App talks to dyn Backend only
+
+backend.local  LocalBackend (local-runtime): runtime in process, default
+
+backend.http   HttpBackend  (legacy-http):   net::Client -> lele serve HTTP/SSE
+
+flags          --backend http|local (default local), --executor ptc|native (default ptc)
+
+;; ---------------------------------------------------------------------------
+
+;; checks performed by ./check-architecture.sh
+
+;; ---------------------------------------------------------------------------
+
+[checks]
+
+;; over crates/core/* and crates/packages/* alike; sibling names derived from the folders
+
+C1  no package depends on runtime or lrs
+
+C2  no package declares a sibling (core/* or packages/*) in Cargo.toml
+
+C3  no package source imports a sibling crate path
+
+C4  a package with a plugin has plugin.toml with [[registrations]]
+
+S1  support/* depends on no workspace crate
+
+K   runtime depends on no core/* or packages/* crate
+
+E   protocol does not depend on sdk

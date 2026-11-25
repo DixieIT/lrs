@@ -1,0 +1,11 @@
+[package]
+name = "tool-permission"
+description = "Permission policy: exports a capability closure, no public check service."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+protocol = { workspace = true }
+sdk = { workspace = true }
+serde_json = { workspace = true }

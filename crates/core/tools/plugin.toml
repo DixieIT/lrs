@@ -1,0 +1,16 @@
+id = "tools"
+name = "tools"
+version = "0.1.0"
+form = "function"
+
+[[registrations]]
+kind = "tool"
+name = "read_file"
+
+[[registrations]]
+kind = "tool"
+name = "write_file"
+
+[[registrations]]
+kind = "tool"
+name = "edit_file"

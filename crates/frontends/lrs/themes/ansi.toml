@@ -1,0 +1,22 @@
+# ansi — defers entirely to your terminal's own 16-colour palette. Use this if you
+# already theme your terminal and want mini-lele to match it automatically instead
+# of imposing its own hex values.
+name = "ansi"
+
+bg = "none"
+
+fg       = "default"
+muted    = "bright-black"
+accent   = "blue"
+border   = "bright-black"
+
+user     = "cyan"
+tool     = "magenta"
+thinking = "green"
+
+ok       = "green"
+warn     = "yellow"
+err      = "red"
+
+add      = "green"
+del      = "red"
