@@ -8,6 +8,7 @@
 //! merges them in so `/goal` completes and runs here exactly as it does in the
 //! Textual TUI, without this crate knowing a thing about goal.
 
+use super::user_commands::UserCommand;
 use std::collections::BTreeMap;
 
 /// The registry, also used to build the completion menu.
@@ -52,14 +53,27 @@ pub enum Command {
     /// Show the model-facing context of the next turn in a popup.
     Context,
     Quit,
+    /// A command the user defined in `~/.lele/lrs/commands`.
+    User { name: String, arg: String },
     /// `!cmd`: run it in the project directory and tell the model what it printed.
     Shell(String),
     /// Not a command — send it to the agent as a turn.
     Send(String),
 }
 
-/// One entry of the live command table: a built-in, or a command a plugin
-/// registered on the server.
+/// Who answers a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// lrs itself; never leaves here.
+    Builtin,
+    /// A plugin registered it on the server, which executes it.
+    Plugin,
+    /// A file in `~/.lele/lrs/commands`; lrs runs its shell command.
+    User,
+}
+
+/// One entry of the live command table: a built-in, a command a plugin
+/// registered on the server, or one the user defined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
@@ -67,8 +81,7 @@ pub struct Entry {
     /// argument → description, as the plugin declared it. A `<placeholder>` key
     /// completes with the placeholder in place, ready to type over.
     pub sub: BTreeMap<String, String>,
-    /// Plugin commands are executed by the server; built-ins never leave here.
-    pub plugin: bool,
+    pub source: Source,
 }
 
 /// Built-ins plus whatever the server's plugins registered.
@@ -87,7 +100,7 @@ impl Table {
                     name: (*name).to_string(),
                     desc: (*desc).to_string(),
                     sub: BTreeMap::new(),
-                    plugin: false,
+                    source: Source::Builtin,
                 })
                 .collect(),
         }
@@ -97,7 +110,7 @@ impl Table {
     /// same rule `merge_plugin_commands` applies on the Python side — otherwise a
     /// plugin could shadow `/quit`.
     pub fn with_plugins(mut self, specs: &[lrs::protocol::CommandSpec]) -> Self {
-        self.entries.retain(|e| !e.plugin);
+        self.entries.retain(|e| e.source != Source::Plugin);
         for spec in specs {
             if self.entries.iter().any(|e| e.name == spec.name) {
                 continue;
@@ -106,11 +119,38 @@ impl Table {
                 name: spec.name.clone(),
                 desc: spec.desc.clone(),
                 sub: spec.sub.clone(),
-                plugin: true,
+                source: Source::Plugin,
             });
         }
         self.entries.sort_by(|a, b| a.name.cmp(&b.name));
         self
+    }
+
+    /// Merge in the user's own commands, replacing any merged before. Built-ins
+    /// and plugin commands win a name clash, so a file cannot shadow `/quit`.
+    pub fn with_user(mut self, user: &[UserCommand]) -> Self {
+        self.entries.retain(|e| e.source != Source::User);
+        for command in user {
+            if self.entries.iter().any(|e| e.name == command.name) {
+                continue;
+            }
+            self.entries.push(Entry {
+                name: command.name.clone(),
+                desc: command.desc.clone(),
+                sub: command.sub.clone(),
+                source: Source::User,
+            });
+        }
+        self.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self
+    }
+
+    /// The names among `user` that something else already answers.
+    pub fn clashes<'a>(&self, user: &'a [UserCommand]) -> Vec<&'a str> {
+        user.iter()
+            .filter(|c| self.entries.iter().any(|e| e.name == c.name && e.source != Source::User))
+            .map(|c| c.name.as_str())
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<&Entry> {
@@ -136,8 +176,14 @@ pub fn parse(raw: &str, table: &Table) -> Command {
     // built-in table only for names the built-ins don't claim, since `with_plugins`
     // already dropped any that collide.
     if let Some(e) = table.get(head) {
-        if e.plugin {
-            return Command::Plugin { name: head.to_string(), arg: rest.to_string() };
+        match e.source {
+            Source::Plugin => {
+                return Command::Plugin { name: head.to_string(), arg: rest.to_string() };
+            }
+            Source::User => {
+                return Command::User { name: head.to_string(), arg: rest.to_string() };
+            }
+            Source::Builtin => {}
         }
     }
 
@@ -202,6 +248,22 @@ mod tests {
     }
 
     #[test]
+    fn a_user_command_is_dispatched_by_name_with_its_arguments() {
+        let user = vec![UserCommand {
+            name: "/inkling".into(), desc: "d".into(), run: "r".into(), to_model: false,
+            sub: Default::default(),
+        }];
+        let table = t().with_user(&user);
+        assert_eq!(
+            parse("/inkling stop", &table),
+            Command::User { name: "/inkling".into(), arg: "stop".into() },
+        );
+        assert_eq!(parse("/inkling", &table), Command::User { name: "/inkling".into(), arg: String::new() });
+        // Without the file it is just text for the model, like any unknown slash.
+        assert_eq!(parse("/inkling", &t()), Command::Send("/inkling".into()));
+    }
+
+    #[test]
     fn a_bang_runs_a_command_and_a_lone_bang_is_just_text() {
         assert_eq!(parse("!git status", &t()), Command::Shell("git status".into()));
         assert_eq!(parse("  !  ls -la ", &t()), Command::Shell("ls -la".into()));
@@ -250,7 +312,7 @@ mod tests {
             sub: BTreeMap::new(),
         }]);
         assert_eq!(parse("/quit", &table), Command::Quit);
-        assert!(!table.get("/quit").unwrap().plugin);
+        assert_eq!(table.get("/quit").unwrap().source, Source::Builtin);
     }
 
     #[test]

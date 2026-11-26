@@ -74,6 +74,27 @@ Flags:
 
 Themes live in `~/.lele/themes/<name>.toml`; switch with `/theme`.
 
+Settings live in `~/.lele/lrs.toml`; `[status]` with `context = false` hides the
+context window gauge under the prompt.
+
+### Your own commands
+
+A file `~/.lele/lrs/commands/<name>.toml` defines `/<name>`:
+
+```toml
+description = "Start or stop the local Inkling server"
+run = "~/models/inkling/inkling.sh"
+to_model = false            # optional; true tells the model what it printed
+
+[sub]                       # optional; the arguments the menu offers
+start = "load the model and serve it"
+stop = "stop the server"
+```
+
+`/inkling stop` runs `run` with `stop` appended, in the project directory, like a
+`!` command: `esc` stops it and its output is in the transcript. Files are read at
+startup and by `/reload`. A built-in or plugin command with the same name wins.
+
 ## Installing
 
 ```console
@@ -98,8 +119,9 @@ that way. If your `PATH` is clean, plain `cargo` works.
 | `shift+enter`, `^j` | newline |
 | `↑`/`↓` | prompt history (the completion menu, while it's open) |
 | `^o` | expand/collapse all tool output |
-| `^c` | cancel the running turn; quit when idle |
-| `esc` | cancel the turn, or clear the input |
+| `!` | on an empty prompt: a command to run here; its output goes to the model |
+| `^c` | stop the turn or command, then clear the input, then quit |
+| `esc` | stop the turn or command, or clear the input |
 | `^p` | attach the clipboard image (`^v` too, where the terminal passes it on) |
 | `pgup`/`pgdn`, `^↑`/`^↓` | scroll |
 | `^l` | jump back to the newest line |

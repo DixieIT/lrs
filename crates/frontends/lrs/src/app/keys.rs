@@ -1193,9 +1193,8 @@ pub(crate) mod tests {
     #[test]
     fn a_second_ctrl_c_while_the_turn_is_stopping_quits() {
         let mut a = app();
-        a.job_id = Some("job".into());
         let (_tx, rx) = std::sync::mpsc::channel();
-        a.rx = Some(rx);
+        a.turn = Some(crate::app::run::Turn { job_id: "job".into(), events: rx, stopping: false });
 
         press(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(a.cancelling(), "the first press asks the turn to stop");

@@ -23,7 +23,15 @@ const LLAMACPP_URL_KEY: &str = "gateway.llamacpp.base_url";
 const LLAMACPP_DEFAULT_URL: &str = "http://127.0.0.1:8080/v1";
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+/// The most one reply may take in all. It is only there so that a connection the
+/// server never answers does not keep its reader thread for ever; how long the
+/// model may be silent is [`STREAM_IDLE_SECS`].
+const STREAM_CEILING: Duration = Duration::from_secs(3600);
+/// How long a reply may go without a single byte before it is given up on. The
+/// first byte of a reply from a local model can be minutes away, while it reads a
+/// long prompt, so this is a setting: `gateway.stream_idle_secs`.
+const STREAM_IDLE_SECS: u64 = 600;
+const STREAM_IDLE_KEY: &str = "gateway.stream_idle_secs";
 
 #[derive(Debug, Clone)]
 struct Endpoint {
@@ -100,6 +108,14 @@ impl Gateway {
     fn endpoint(&self, provider: &str) -> Result<&Endpoint> {
         self.endpoints.iter().find(|e| e.name == provider)
             .ok_or_else(|| Error::InvalidInput(format!("unknown provider {provider}")))
+    }
+
+    fn stream_idle_limit(&self) -> Duration {
+        let secs = self.config.get(STREAM_IDLE_KEY).ok().flatten()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(STREAM_IDLE_SECS);
+        Duration::from_secs(secs)
     }
 
     /// The window a running llama.cpp server was started with. Its model list
@@ -279,9 +295,10 @@ impl ModelGateway for Gateway {
             }),
         };
         let url = format!("{}/chat/completions", endpoint.base_url);
-        let agent = self.agent(STREAM_TIMEOUT)?;
+        let agent = self.agent(STREAM_CEILING)?;
+        let idle_limit = self.stream_idle_limit();
         let dialect = endpoint.dialect;
-        Background::spawn(move |send| {
+        Background::spawn(idle_limit, move |send| {
             let response = authorized(agent.post(&url), &key)
                 .header("Content-Type", "application/json")
                 .send_json(&body);
@@ -566,20 +583,31 @@ const IDLE_POLL: Duration = Duration::from_millis(200);
 ///
 /// Dropping the stream drops the channel. The reader notices at the next chunk
 /// it delivers, stops, and closes the connection; a read already in progress
-/// ends when the server sends something or the stream timeout runs out.
+/// ends when the server sends something or the stream ceiling runs out.
+///
+/// A reply that stays silent for `idle_limit` is an error. Time counts from the
+/// last thing the server sent, not from the start, so a long answer that keeps
+/// arriving is never cut, and `Idle` chunks, which are this side talking, do not
+/// reset it.
 struct Background {
     received: std::sync::mpsc::Receiver<Result<Chunk>>,
+    idle_limit: Duration,
+    last_heard: Instant,
+    gave_up: bool,
 }
 
 impl Background {
-    fn spawn(work: impl FnOnce(&dyn Fn(Result<Chunk>) -> bool) + Send + 'static) -> Result<Stream> {
+    fn spawn(
+        idle_limit: Duration,
+        work: impl FnOnce(&dyn Fn(Result<Chunk>) -> bool) + Send + 'static,
+    ) -> Result<Stream> {
         let (sender, received) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("gateway-stream".into())
             // `false` tells the reader nobody is listening any more.
             .spawn(move || work(&|item| sender.send(item).is_ok()))
             .map_err(|e| Error::Unavailable(format!("could not start the response reader: {e}")))?;
-        Ok(Box::new(Self { received }))
+        Ok(Box::new(Self { received, idle_limit, last_heard: Instant::now(), gave_up: false }))
     }
 }
 
@@ -587,9 +615,24 @@ impl Iterator for Background {
     type Item = Result<Chunk>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.gave_up {
+            return None;
+        }
         match self.received.recv_timeout(IDLE_POLL) {
-            Ok(item) => Some(item),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Ok(Chunk::Idle)),
+            Ok(item) => {
+                self.last_heard = Instant::now();
+                Some(item)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if self.last_heard.elapsed() >= self.idle_limit {
+                    self.gave_up = true;
+                    return Some(Err(Error::Unavailable(format!(
+                        "no answer from the model for {} s (setting {STREAM_IDLE_KEY})",
+                        self.idle_limit.as_secs()
+                    ))));
+                }
+                Some(Ok(Chunk::Idle))
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
         }
     }
@@ -884,7 +927,7 @@ mod tests {
     #[test]
     fn a_silent_response_yields_idle_until_the_first_chunk_arrives() {
         let (go, wait) = std::sync::mpsc::channel::<()>();
-        let mut stream = Background::spawn(move |send| {
+        let mut stream = Background::spawn(Duration::from_secs(60), move |send| {
             // The provider is still reading the prompt: nothing to send yet.
             wait.recv().ok();
             send(Ok(Chunk::TextDelta("hi".into())));
@@ -903,10 +946,67 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_that_stays_silent_past_the_limit_is_an_error_naming_the_setting() {
+        let (_keep_open, wait) = std::sync::mpsc::channel::<()>();
+        let mut stream = Background::spawn(Duration::from_millis(300), move |_send| {
+            wait.recv().ok();
+        }).unwrap();
+        let outcome = loop {
+            match stream.next() {
+                Some(Ok(Chunk::Idle)) => continue,
+                other => break other,
+            }
+        };
+        match outcome {
+            Some(Err(Error::Unavailable(why))) => assert!(why.contains(STREAM_IDLE_KEY), "{why}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(stream.next().is_none(), "it gives up once");
+    }
+
+    #[test]
+    fn a_reply_that_keeps_arriving_is_never_cut_however_long_it_runs() {
+        // Longer in all than the limit, but never silent for as long as it.
+        let mut stream = Background::spawn(Duration::from_millis(450), |send| {
+            for n in 0..6 {
+                std::thread::sleep(Duration::from_millis(150));
+                if !send(Ok(Chunk::TextDelta(format!("{n}")))) {
+                    return;
+                }
+            }
+        }).unwrap();
+        let mut got = 0;
+        loop {
+            match stream.next() {
+                Some(Ok(Chunk::Idle)) => continue,
+                Some(Ok(Chunk::TextDelta(_))) => got += 1,
+                Some(other) => panic!("unexpected {other:?}"),
+                None => break,
+            }
+        }
+        assert_eq!(got, 6);
+    }
+
+    #[test]
+    fn the_silence_limit_is_a_setting_with_a_default() {
+        let config = Mem::default();
+        let gw = Gateway::new(Arc::new(Mem::default()), Arc::new(config));
+        assert_eq!(gw.stream_idle_limit(), Duration::from_secs(STREAM_IDLE_SECS));
+        let config = Mem::default();
+        ConfigStore::set(&config, STREAM_IDLE_KEY, "1800").unwrap();
+        let gw = Gateway::new(Arc::new(Mem::default()), Arc::new(config));
+        assert_eq!(gw.stream_idle_limit(), Duration::from_secs(1800));
+        let config = Mem::default();
+        ConfigStore::set(&config, STREAM_IDLE_KEY, "soon").unwrap();
+        let gw = Gateway::new(Arc::new(Mem::default()), Arc::new(config));
+        assert_eq!(gw.stream_idle_limit(), Duration::from_secs(STREAM_IDLE_SECS), "a bad value falls back");
+    }
+
+    #[test]
     fn dropping_the_stream_stops_the_reader() {
         let (stopped, observed) = std::sync::mpsc::channel::<bool>();
         let (go, wait) = std::sync::mpsc::channel::<()>();
-        let stream = Background::spawn(move |send| {
+        let stream = Background::spawn(Duration::from_secs(60), move |send| {
             wait.recv().ok();
             // Once the consumer is gone, delivering fails and the reader quits.
             stopped.send(send(Ok(Chunk::TextDelta("late".into())))).ok();
@@ -918,7 +1018,7 @@ mod tests {
 
     #[test]
     fn a_failed_request_reaches_the_consumer_as_the_first_item() {
-        let mut stream = Background::spawn(|send| {
+        let mut stream = Background::spawn(Duration::from_secs(60), |send| {
             send(Err(Error::AuthRequired { provider: "p".into() }));
         }).unwrap();
         loop {

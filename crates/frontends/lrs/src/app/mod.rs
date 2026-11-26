@@ -10,8 +10,10 @@ pub mod keys;
 pub mod log;
 pub mod paste;
 pub mod resume;
+pub mod run;
 pub mod shell;
 pub mod side;
+pub mod user_commands;
 
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -138,18 +140,19 @@ pub struct App {
     client: std::sync::Arc<dyn crate::backend::Backend>,
     cwd: String,
     session_id: Option<String>,
-    job_id: Option<String>,
-    /// The turn was asked to stop and has not ended yet. A second `^c` in that
-    /// state leaves instead of asking again, so a stuck cancel never traps you.
-    cancelling: bool,
-    /// Raised to stop the `!` command that is running, `None` when none is.
-    shell: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The turn that is running, if any. Asking it to stop marks it, and a second
+    /// `^c` while it is marked leaves instead of asking again, so a stuck cancel
+    /// never traps you.
+    turn: Option<run::Turn>,
+    /// The `!` or user command that is running, if any, with the same marking.
+    shell: Option<run::ShellRun>,
+    /// Commands the user defined as files; see [`user_commands`].
+    user_commands: Vec<user_commands::UserCommand>,
     /// Commands run with `!` since the last turn: the next one tells the model.
     shell_ran: Vec<shell::Ran>,
     /// Herdr pane id, forwarded per-run so the herdr plugin in serve can report
     /// agent state to this pane. `None` outside herdr.
     pane_id: Option<String>,
-    rx: Option<Receiver<Event>>,
     /// Results of off-thread work (catalog, key probe, session read). Kept for the
     /// whole lifetime of the app so a background thread always has somewhere to post.
     side_tx: Sender<Side>,
@@ -221,6 +224,19 @@ impl App {
             ..Default::default()
         };
 
+        let (user_commands, user_errors) =
+            user_commands::dir().map(|d| user_commands::load(&d)).unwrap_or_default();
+        for e in user_errors {
+            blocks.push(Block::Notice { text: e, level: Level::Warn });
+        }
+        let builtin = commands::Table::builtin();
+        for name in builtin.clashes(&user_commands) {
+            blocks.push(Block::Notice {
+                text: format!("commands: {name} is already a command; its file is ignored"),
+                level: Level::Warn,
+            });
+        }
+
         let (side_tx, side_rx) = mpsc::channel();
         App {
             blocks,
@@ -244,19 +260,18 @@ impl App {
             selection: None,
             transcript_rect: ratatui::layout::Rect::default(),
             toast: None,
-            commands: commands::Table::builtin(),
+            commands: builtin.with_user(&user_commands),
             widgets: Vec::new(),
             queued: Vec::new(),
             pending_turn: None,
             client,
             cwd,
             session_id: None,
-            job_id: None,
-            cancelling: false,
+            turn: None,
             shell: None,
+            user_commands,
             shell_ran: Vec::new(),
             pane_id: std::env::var("HERDR_PANE_ID").ok().filter(|s| !s.is_empty()),
-            rx: None,
             side_tx,
             side_rx,
             model_override: None,
@@ -270,7 +285,7 @@ impl App {
     }
 
     pub fn busy(&self) -> bool {
-        self.rx.is_some()
+        self.turn.is_some()
     }
 
     pub fn notice(&mut self, text: impl Into<String>, level: Level) {
@@ -313,6 +328,7 @@ impl App {
         match commands::parse(&raw, &self.commands) {
             Command::Send(task) => self.start_turn(task),
             Command::Shell(command) => self.run_shell(command),
+            Command::User { name, arg } => self.run_user_command(&name, &arg),
             Command::Image => self.paste_image(),
             Command::Plugin { name, arg } => self.run_plugin_command(&name, &arg),
             Command::Registry { plugins } => self.open_registry_picker(plugins),
@@ -625,6 +641,7 @@ impl App {
 
     /// Re-register plugins and extensions on the server.
     pub fn reload(&mut self) {
+        self.reload_user_commands();
         self.notice("reloading plugins and extensions…", Level::Info);
         let client = self.client.clone();
         let tx = self.side_tx.clone();
@@ -905,11 +922,10 @@ impl App {
             Ok(resp) => {
                 self.session_id = Some(resp.session_id.clone());
                 self.status.session = resp.session_id;
-                self.job_id = Some(resp.job_id.clone());
                 self.status.busy = true;
 
                 let (tx, rx) = mpsc::channel();
-                self.rx = Some(rx);
+                self.turn = Some(run::Turn { job_id: resp.job_id.clone(), events: rx, stopping: false });
                 self.spinner.restart();
                 let client = self.client.clone();
                 std::thread::spawn(move || {
@@ -947,7 +963,7 @@ impl App {
             self.notice("an image needs its own turn — ^c to cancel this one", Level::Warn);
             return;
         }
-        let Some(job) = self.job_id.clone() else {
+        let Some(job) = self.turn.as_ref().map(|t| t.job_id.clone()) else {
             self.notice("no running turn to steer", Level::Warn);
             return;
         };
@@ -1018,17 +1034,52 @@ impl App {
         }
     }
 
-    /// Run a `!` command off the UI thread, in the project directory. One at a
-    /// time: its block is how the result finds its place in the transcript.
+    /// `!cmd`: run it, and tell the model what it printed.
     fn run_shell(&mut self, command: String) {
+        self.start_shell(shell::Job { title: shell_title(&command), command, to_model: true });
+    }
+
+    /// `/name args` for a command the user defined.
+    fn run_user_command(&mut self, name: &str, arg: &str) {
+        let Some(command) = self.user_commands.iter().find(|c| c.name == name).cloned() else {
+            self.notice(format!("{name} is no longer defined — /reload re-reads the files"), Level::Warn);
+            return;
+        };
+        self.start_shell(shell::Job {
+            title: format!("{name} {}", arg.trim()).trim_end().to_string(),
+            command: command.command_line(arg),
+            to_model: command.to_model,
+        });
+    }
+
+    /// Re-read `~/.lele/lrs/commands`, so an edited or new file counts without
+    /// restarting lrs.
+    fn reload_user_commands(&mut self) {
+        let (found, errors) = user_commands::dir()
+            .map(|d| user_commands::load(&d))
+            .unwrap_or_default();
+        for e in errors {
+            self.notice(e, Level::Warn);
+        }
+        let table = self.commands.clone().with_user(&[]);
+        for name in table.clashes(&found) {
+            self.notice(format!("commands: {name} is already a command; its file is ignored"), Level::Warn);
+        }
+        self.commands = table.with_user(&found);
+        self.user_commands = found;
+    }
+
+    /// Run a command off the UI thread, in the project directory. One at a time:
+    /// its block is how the result finds its place in the transcript.
+    fn start_shell(&mut self, job: shell::Job) {
         if self.shell.is_some() {
             self.notice("a command is already running — esc to stop it", Level::Warn);
             return;
         }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.shell = Some(stop.clone());
+        self.shell = Some(run::ShellRun { stop: stop.clone(), stopping: false });
         self.blocks.push(Block::Tool {
-            title: shell_title(&command),
+            title: job.title.clone(),
             body: None,
             kind: block::body_kind("bash"),
             failed: false,
@@ -1039,27 +1090,24 @@ impl App {
         self.touch();
         let (tx, cwd) = (self.side_tx.clone(), self.cwd.clone());
         std::thread::spawn(move || {
-            let result = shell::run(&cwd, &command, &stop);
-            side::deliver(&tx, Side::Shell { command, result });
+            let result = shell::run(&cwd, &job.command, &stop);
+            side::deliver(&tx, Side::Shell { job, result });
         });
     }
 
-    /// Fill the command's block. A finished command is sent to the model as a
-    /// turn of its own; one that was stopped or never started told it nothing.
-    fn shell_finished(&mut self, command: String, result: Result<shell::ShellResult, String>) {
+    /// Fill the command's block. A finished command that is for the model is sent
+    /// to it as a turn of its own; one that was stopped or never started told it
+    /// nothing.
+    fn shell_finished(&mut self, job: shell::Job, result: Result<shell::ShellResult, String>) {
         use shell::ShellResult;
         self.shell = None;
-        if !self.busy() {
-            self.cancelling = false;
-        }
         let (text, failed) = match &result {
             Ok(ShellResult::Finished { text, failed }) => (text.clone(), *failed),
             Ok(ShellResult::Stopped) => ("(stopped)".to_string(), true),
             Err(e) => (e.clone(), true),
         };
-        let title = shell_title(&command);
         let slot = self.blocks.iter_mut().rev().find(
-            |b| matches!(b, Block::Tool { title: t, body: None, .. } if *t == title),
+            |b| matches!(b, Block::Tool { title: t, body: None, .. } if *t == job.title),
         );
         if let Some(Block::Tool { body, failed: slot_failed, started, took, .. }) = slot {
             *body = Some(text.clone());
@@ -1067,11 +1115,13 @@ impl App {
             *took = started.map(|at| at.elapsed());
         }
         if let Ok(ShellResult::Finished { .. }) = result {
-            self.shell_ran.push(shell::Ran { command, output: text });
-            // The output is the message: send it now instead of waiting for the
-            // next one. While a turn runs it is kept for the next turn instead.
-            if !self.busy() {
-                self.send_turn(String::new(), false);
+            if job.to_model {
+                self.shell_ran.push(shell::Ran { command: job.command, output: text });
+                // The output is the message: send it now instead of waiting for
+                // the next one. While a turn runs it is kept for the next turn.
+                if !self.busy() {
+                    self.send_turn(String::new(), false);
+                }
             }
         }
         self.follow = true;
@@ -1086,31 +1136,35 @@ impl App {
     }
 
     pub fn cancel(&mut self) {
-        let command = self.shell.as_ref().map(|stop| {
-            stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
-        let turn = self.job_id.clone();
-        if let Some(job) = &turn {
+        let mut asked = false;
+        if let Some(run) = &mut self.shell {
+            run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            run.stopping = true;
+            asked = true;
+        }
+        if let Some(turn) = &mut self.turn {
+            turn.stopping = true;
+            asked = true;
             // ^c is the key you press when something is already wrong, so it is
             // the last one that may block on the server answering.
             let client = self.client.clone();
             let tx = self.side_tx.clone();
-            let job = job.clone();
+            let job = turn.job_id.clone();
             std::thread::spawn(move || {
                 if let Err(e) = client.cancel(&job) {
                     side::deliver(&tx, Side::CancelFailed(e.to_string()));
                 }
             });
         }
-        if command.is_some() || turn.is_some() {
-            self.cancelling = true;
+        if asked {
             self.notice("cancelling…", Level::Warn);
         }
     }
 
     /// A stop was requested for the turn or command that is still running.
     pub fn cancelling(&self) -> bool {
-        self.cancelling
+        self.turn.as_ref().is_some_and(|t| t.stopping)
+            || self.shell.as_ref().is_some_and(|s| s.stopping)
     }
 
     // ── streaming ─────────────────────────────────────────────────────────────
@@ -1121,9 +1175,9 @@ impl App {
         self.expire_toast();
         self.pump_side();
         self.refresh_files();
-        let Some(rx) = &self.rx else { return };
+        let Some(turn) = &self.turn else { return };
         let mut done = false;
-        let events: Vec<Event> = rx.try_iter().collect();
+        let events: Vec<Event> = turn.events.try_iter().collect();
         if events.is_empty() {
             return;
         }
@@ -1134,9 +1188,7 @@ impl App {
         }
         self.touch();
         if done {
-            self.rx = None;
-            self.job_id = None;
-            self.cancelling = false;
+            self.turn = None;
             self.status.busy = false;
             // Only now, with `busy()` false again, or it would steer itself into
             // the job that just finished.
@@ -1298,14 +1350,16 @@ impl App {
                     self.notice(format!("could not steer the turn: {e}"), Level::Warn)
                 }
                 Side::Plugins { commands, widgets } => {
-                    self.commands = commands::Table::builtin().with_plugins(&commands);
+                    self.commands = commands::Table::builtin()
+                        .with_plugins(&commands)
+                        .with_user(&self.user_commands);
                     self.widgets.clear();
                     for w in widgets {
                         self.set_widget(&w.id, Some(w.markup));
                     }
                 }
                 Side::CancelFailed(e) => self.notice(format!("could not cancel: {e}"), Level::Error),
-                Side::Shell { command, result } => self.shell_finished(command, result),
+                Side::Shell { job, result } => self.shell_finished(job, result),
                 Side::Context(result) => match result {
                     Ok(res) if res.error.is_none() => {
                         self.overlay = Some(Overlay::View(Viewer::new("Context", crate::ui::context::rows(&res.output))));
@@ -3460,8 +3514,77 @@ mod tests {
     /// Put the app in the state a live turn produces, without a server.
     fn make_busy(a: &mut App) -> mpsc::Sender<Event> {
         let (tx, rx) = mpsc::channel();
-        a.rx = Some(rx);
+        a.turn = Some(run::Turn { job_id: "job".into(), events: rx, stopping: false });
         tx
+    }
+
+    /// What `!cmd` hands to the runner.
+    fn bang(command: &str) -> shell::Job {
+        shell::Job { title: shell_title(command), command: command.into(), to_model: true }
+    }
+
+    fn user_command(name: &str, run: &str, to_model: bool) -> user_commands::UserCommand {
+        user_commands::UserCommand {
+            name: name.into(), desc: String::new(), run: run.into(), to_model, sub: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_user_command_runs_its_shell_line_with_the_arguments_and_shows_under_its_own_name() {
+        let mut a = app();
+        a.blocks.clear();
+        a.user_commands = vec![user_command("/inkling", "echo inkling", false)];
+        a.commands = a.commands.clone().with_user(&a.user_commands);
+        a.ed.set("/inkling start");
+        a.submit();
+        assert!(a.shell.is_some(), "it runs like a `!` command, so esc stops it");
+        assert!(matches!(a.blocks.last(), Some(Block::Tool { title, .. }) if title == "/inkling start"));
+    }
+
+    #[test]
+    fn a_user_command_is_not_sent_to_the_model_unless_its_file_says_so() {
+        use shell::ShellResult;
+        let finished = || Ok(ShellResult::Finished { text: "ok".into(), failed: false });
+        let job = |to_model| shell::Job { title: "/x".into(), command: "x".into(), to_model };
+
+        let mut quiet = app();
+        quiet.blocks.push(Block::Tool {
+            title: "/x".into(), body: None, kind: Body::Plain, failed: false,
+            started: Some(std::time::Instant::now()), took: None,
+        });
+        quiet.shell = Some(run::ShellRun::default());
+        quiet.shell_finished(job(false), finished());
+        assert!(quiet.shell_ran.is_empty(), "nothing queued for the model");
+        assert!(matches!(&quiet.blocks.last(), Some(Block::Tool { body: Some(b), .. }) if b == "ok"));
+
+        let mut told = app();
+        told.shell = Some(run::ShellRun::default());
+        told.shell_finished(job(true), finished());
+        // Nothing listens on the test client's port, so the turn it starts fails
+        // and the output is kept for the next one.
+        assert_eq!(told.shell_ran.len(), 1, "the model is to be told");
+    }
+
+    #[test]
+    fn a_user_command_never_shadows_a_built_in() {
+        let user = [user_command("/quit", "true", false), user_command("/inkling", "true", false)];
+        let table = commands::Table::builtin();
+        assert_eq!(table.clashes(&user), vec!["/quit"]);
+        let merged = table.with_user(&user);
+        assert_eq!(merged.get("/quit").unwrap().source, commands::Source::Builtin);
+        assert_eq!(merged.get("/inkling").unwrap().source, commands::Source::User);
+    }
+
+    #[test]
+    fn plugin_commands_arriving_later_do_not_drop_the_users() {
+        let mut a = app();
+        a.user_commands = vec![user_command("/inkling", "true", false)];
+        a.side_tx
+            .send(Side::Plugins { commands: vec![goal_spec()], widgets: Vec::new() })
+            .unwrap();
+        a.pump_side();
+        assert!(a.commands.get("/goal").is_some());
+        assert_eq!(a.commands.get("/inkling").unwrap().source, commands::Source::User);
     }
 
     #[test]
@@ -3469,12 +3592,12 @@ mod tests {
         use shell::ShellResult;
         let mut a = app();
         a.blocks.clear();
-        a.shell = Some(Default::default());
+        a.shell = Some(run::ShellRun::default());
         a.blocks.push(Block::Tool {
             title: shell_title("ls"), body: None, kind: Body::Plain, failed: false,
             started: Some(std::time::Instant::now()), took: None,
         });
-        a.shell_finished("ls".into(), Ok(ShellResult::Finished { text: "a.txt".into(), failed: false }));
+        a.shell_finished(bang("ls"), Ok(ShellResult::Finished { text: "a.txt".into(), failed: false }));
 
         assert!(a.shell.is_none(), "the command is over");
         assert!(matches!(&a.blocks[0], Block::Tool { body: Some(b), failed: false, .. } if b == "a.txt"));
@@ -3491,8 +3614,8 @@ mod tests {
         use shell::ShellResult;
         let mut a = app();
         let _tx = make_busy(&mut a);
-        a.shell = Some(Default::default());
-        a.shell_finished("ls".into(), Ok(ShellResult::Finished { text: "a".into(), failed: false }));
+        a.shell = Some(run::ShellRun::default());
+        a.shell_finished(bang("ls"), Ok(ShellResult::Finished { text: "a".into(), failed: false }));
         assert!(!a.blocks.iter().any(|b| matches!(b, Block::Notice { level: Level::Error, .. })),
             "starting a second turn would have failed here, and said so");
         assert_eq!(a.shell_ran.len(), 1, "kept for the next turn");
@@ -3566,13 +3689,13 @@ mod tests {
     fn a_command_redraws_the_transcript_when_it_starts_and_when_it_ends() {
         use shell::ShellResult;
         let mut a = app();
-        a.shell = Some(Default::default());
+        a.shell = Some(run::ShellRun::default());
         a.blocks.push(Block::Tool {
             title: shell_title("ls"), body: None, kind: Body::Plain, failed: false,
             started: Some(std::time::Instant::now()), took: None,
         });
         let before = a.revision;
-        a.shell_finished("ls".into(), Ok(ShellResult::Finished { text: "a".into(), failed: false }));
+        a.shell_finished(bang("ls"), Ok(ShellResult::Finished { text: "a".into(), failed: false }));
         assert_ne!(a.revision, before, "the result would stay invisible until the next key");
 
         let started = a.revision;
@@ -3585,8 +3708,8 @@ mod tests {
         use shell::ShellResult;
         for result in [Ok(ShellResult::Stopped), Err("no shell".to_string())] {
             let mut a = app();
-            a.shell = Some(Default::default());
-            a.shell_finished("sleep 9".into(), result);
+            a.shell = Some(run::ShellRun::default());
+            a.shell_finished(bang("sleep 9"), result);
             assert!(a.shell_ran.is_empty());
             assert!(a.shell.is_none());
         }
@@ -3596,7 +3719,7 @@ mod tests {
     fn only_one_command_runs_at_a_time() {
         let mut a = app();
         let running: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
-        a.shell = Some(running.clone());
+        a.shell = Some(run::ShellRun { stop: running.clone(), stopping: false });
         let blocks = a.blocks.len();
         a.run_shell("ls".into());
         assert_eq!(a.blocks.len() - blocks, 1, "only the warning, no second block");
@@ -3604,10 +3727,22 @@ mod tests {
     }
 
     #[test]
+    fn a_request_to_stop_ends_with_the_turn_it_was_for() {
+        let mut a = app();
+        let tx = make_busy(&mut a);
+        a.turn.as_mut().unwrap().stopping = true;
+        assert!(a.cancelling());
+        tx.send(Event::JobFinished { leftover_steers: Vec::new() }).unwrap();
+        a.pump();
+        assert!(!a.busy(), "the turn is over");
+        assert!(!a.cancelling(), "and the next one starts with no stop pending");
+    }
+
+    #[test]
     fn escape_stops_a_running_command() {
         let mut a = app();
         let running: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
-        a.shell = Some(running.clone());
+        a.shell = Some(run::ShellRun { stop: running.clone(), stopping: false });
         assert!(a.working() && !a.busy(), "a command is not a turn");
         keys::tests::press_esc(&mut a);
         assert!(running.load(std::sync::atomic::Ordering::SeqCst));

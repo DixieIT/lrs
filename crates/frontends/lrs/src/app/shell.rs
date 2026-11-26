@@ -3,6 +3,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// A command lrs runs for the user: what to show it as, what to run, and whether
+/// the model is told what it printed.
+pub struct Job {
+    /// The transcript block's title, which is also how the result finds it.
+    pub title: String,
+    pub command: String,
+    pub to_model: bool,
+}
+
 /// How a command typed with `!` ended.
 pub enum ShellResult {
     /// It ran to the end, or hit the tool's own timeout, and printed `text`.

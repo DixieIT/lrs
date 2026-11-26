@@ -166,6 +166,15 @@ struct AgentState {
     status_listeners: Vec<Arc<dyn Fn(AgentStatus) + Send + Sync>>,
 }
 
+/// What a step has put in the conversation, and what it still owes it.
+struct InFlight {
+    messages: Vec<SessionMessage>,
+    /// Text the model has streamed that is not a message yet.
+    text: String,
+    /// Calls the model made that have no result yet.
+    unanswered: Vec<ToolCall>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ToolCall {
     id: String,
@@ -327,34 +336,27 @@ impl ReactLoopAgent {
     /// kept, with a marker, instead of leaving user messages with no answer
     /// between them. A failure before any text leaves nothing to keep: the
     /// prompt can simply be sent again.
-    fn close_conversation(
-        &self,
-        messages: &mut Vec<SessionMessage>,
-        sink: &dyn EventSink,
-        cause: Interruption,
-        partial: &str,
-        unanswered: &[ToolCall],
-    ) {
-        let nothing_said = partial.is_empty() && cause == Interruption::Failed;
-        if unanswered.is_empty() && !nothing_said {
+    fn close_conversation(&self, flight: &mut InFlight, sink: &dyn EventSink, cause: Interruption) {
+        let nothing_said = flight.text.is_empty() && cause == Interruption::Failed;
+        if flight.unanswered.is_empty() && !nothing_said {
             let marker = cause.reply_marker();
-            let content = if partial.is_empty() {
+            let content = if flight.text.is_empty() {
                 marker.to_string()
             } else {
-                format!("{partial}\n\n{marker}")
+                format!("{}\n\n{marker}", flight.text)
             };
-            add(messages, sink, SessionMessage {
+            add(&mut flight.messages, sink, SessionMessage {
                 id: String::new(), role: Role::Assistant, content, created_at: 0,
                 tool_calls: Vec::new(),
             });
         }
-        for call in unanswered {
-            add(messages, sink, SessionMessage {
-                id: call.id.clone(), role: Role::Tool, content: cause.tool_result().into(),
+        for call in std::mem::take(&mut flight.unanswered) {
+            add(&mut flight.messages, sink, SessionMessage {
+                id: call.id, role: Role::Tool, content: cause.tool_result().into(),
                 created_at: 0, tool_calls: Vec::new(),
             });
         }
-        self.state.lock().unwrap().turn_messages = messages.clone();
+        self.state.lock().unwrap().turn_messages = std::mem::take(&mut flight.messages);
     }
 
     fn model_for(&self, tc: &TurnContext<'_>) -> Result<String> {
@@ -470,6 +472,12 @@ impl ReactLoopAgent {
         Ok(more)
     }
 
+    /// One step: model calls and the tool rounds they ask for, until the model
+    /// answers or a round of tools has run.
+    ///
+    /// Every way out goes through here, so the conversation is made valid in one
+    /// place: whatever `run_step` left half done is closed by `close_conversation`
+    /// before the error goes on. A new early return inside the step cannot forget it.
     fn step(
         &self,
         tc: &TurnContext<'_>,
@@ -477,46 +485,62 @@ impl ReactLoopAgent {
         abort: &Abort,
         selection: &str,
     ) -> Result<StepEnd> {
+        let mut flight = InFlight {
+            messages: self.state.lock().unwrap().turn_messages.clone(),
+            text: String::new(),
+            unanswered: Vec::new(),
+        };
+        let end = self.run_step(tc, sink, abort, selection, &mut flight);
+        match &end {
+            Ok(_) => {
+                self.state.lock().unwrap().turn_messages = std::mem::take(&mut flight.messages);
+            }
+            Err(error) => {
+                let cause = match error {
+                    Error::Cancelled => Interruption::Cancelled,
+                    _ => Interruption::Failed,
+                };
+                self.close_conversation(&mut flight, sink, cause);
+            }
+        }
+        end
+    }
+
+    fn run_step(
+        &self,
+        tc: &TurnContext<'_>,
+        sink: &dyn EventSink,
+        abort: &Abort,
+        selection: &str,
+        flight: &mut InFlight,
+    ) -> Result<StepEnd> {
         // The executor decides what the model is offered: every tool (native)
         // or one code tool that calls them (PTC).
         let definitions: Vec<Value> = tc.executor.definitions(tc.tools);
-        let mut messages = {
-            let s = self.state.lock().unwrap();
-            s.turn_messages.clone()
-        };
         let mut step_guard = 0usize;
         loop {
             step_guard += 1;
             debug_assert!(step_guard < 1024, "step loop did not converge");
             if Self::cancelled(tc, abort) {
-                self.close_conversation(&mut messages, sink, Interruption::Cancelled, "", &[]);
                 return Err(Error::Cancelled);
             }
-            let mut stream = tc.gateway.stream(selection, &messages, &definitions)?;
+            let mut stream = tc.gateway.stream(selection, &flight.messages, &definitions)?;
             let mut calls: Vec<ToolCall> = Vec::new();
-            let mut text = String::new();
+            flight.text.clear();
             let mut usage = None;
 
             // Cancelled before each pull, so no chunk is read after the user
             // asked to stop; returning drops the stream and its connection.
             loop {
                 if Self::cancelled(tc, abort) {
-                    self.close_conversation(&mut messages, sink, Interruption::Cancelled, &text, &[]);
                     return Err(Error::Cancelled);
                 }
                 let Some(chunk) = stream.next() else { break };
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(e) => {
-                        self.close_conversation(&mut messages, sink, Interruption::Failed, &text, &[]);
-                        return Err(e);
-                    }
-                };
-                match chunk {
+                match chunk? {
                     // Nothing arrived yet: the loop only needs to look again.
                     Chunk::Idle => {}
                     Chunk::TextDelta(t) => {
-                        text.push_str(&t);
+                        flight.text.push_str(&t);
                         sink.emit(Event::TextDelta { text: t });
                     }
                     Chunk::Thinking(t) => sink.emit(Event::Thinking { text: t }),
@@ -546,31 +570,29 @@ impl ReactLoopAgent {
                     context_limit: tc.gateway.context_limit(selection),
                 });
             }
+            let text = std::mem::take(&mut flight.text);
             if calls.is_empty() {
                 if !text.is_empty() {
-                    add(&mut messages, sink, SessionMessage {
+                    add(&mut flight.messages, sink, SessionMessage {
                         id: String::new(), role: Role::Assistant, content: text, created_at: 0,
                         tool_calls: Vec::new(),
                     });
                 }
-                self.state.lock().unwrap().turn_messages = messages;
                 return Ok(StepEnd::Completed);
             }
 
             // The assistant's request goes into the conversation before the
             // results, so the model sees its own calls on the next request.
-            add(&mut messages, sink, SessionMessage {
+            add(&mut flight.messages, sink, SessionMessage {
                 id: String::new(), role: Role::Assistant, content: text, created_at: 0,
                 tool_calls: calls.iter().map(|c| protocol::ToolCall {
                     id: c.id.clone(), name: c.name.clone(), arguments: c.raw_args.clone(),
                 }).collect(),
             });
+            flight.unanswered = calls;
 
-            for (index, call) in calls.iter().enumerate() {
+            while let Some(call) = flight.unanswered.first().cloned() {
                 if Self::cancelled(tc, abort) {
-                    self.close_conversation(
-                        &mut messages, sink, Interruption::Cancelled, "", &calls[index..],
-                    );
                     return Err(Error::Cancelled);
                 }
                 let parsed = parse_arguments(&call.raw_args);
@@ -587,23 +609,15 @@ impl ReactLoopAgent {
                         &call.name, args, tc.tools, &tc.tool_context, tc.permission,
                     ) {
                         Ok(out) => out,
-                        // The tool was stopped: its call, and every call after
-                        // it, is answered so the conversation stays valid.
+                        // A stopped tool shows as stopped; its call, and every
+                        // call after it, is answered by `step`.
                         Err(Error::Cancelled) => {
                             sink.emit(Event::ToolCallEnd {
                                 id: call.id.clone(), output: TOOL_INTERRUPTED.into(), failed: true,
                             });
-                            self.close_conversation(
-                                &mut messages, sink, Interruption::Cancelled, "", &calls[index..],
-                            );
                             return Err(Error::Cancelled);
                         }
-                        Err(e) => {
-                            self.close_conversation(
-                                &mut messages, sink, Interruption::Failed, "", &calls[index..],
-                            );
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     },
                     Err(reason) => ToolOutput::err(reason),
                 };
@@ -613,22 +627,19 @@ impl ReactLoopAgent {
                 sink.emit(Event::ToolCallEnd {
                     id: call.id.clone(), output: out.content, failed: out.is_error,
                 });
-                add(&mut messages, sink, SessionMessage {
+                add(&mut flight.messages, sink, SessionMessage {
                     id: call.id.clone(), role: Role::Tool, content: for_model, created_at: 0,
                     tool_calls: Vec::new(),
                 });
+                flight.unanswered.remove(0);
             }
 
             for text in tc.controller.take_steers() {
                 sink.emit(Event::Steered { text: text.clone() });
-                add(&mut messages, sink, SessionMessage {
+                add(&mut flight.messages, sink, SessionMessage {
                     id: String::new(), role: Role::User, content: text, created_at: 0,
                     tool_calls: Vec::new(),
                 });
-            }
-            {
-                let mut s = self.state.lock().unwrap();
-                s.turn_messages = messages;
             }
             debug!(agent = %self.id, "tool round completed, continuing step");
             return Ok(StepEnd::ToolRound);
