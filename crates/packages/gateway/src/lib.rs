@@ -47,6 +47,9 @@ pub struct Gateway {
     config: Arc<dyn ConfigStore>,
     endpoints: Vec<Endpoint>,
     catalog: RwLock<Option<(Instant, Vec<ModelInfo>)>>,
+    /// What a local server reported as its window, per endpoint, with the time
+    /// it was asked: a server can be restarted with another size.
+    windows: Mutex<HashMap<String, (Instant, u64)>>,
     keys: Mutex<HashMap<String, String>>,
 }
 
@@ -89,6 +92,7 @@ impl Gateway {
             config,
             endpoints,
             catalog: RwLock::new(None),
+            windows: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
         }
     }
@@ -96,6 +100,25 @@ impl Gateway {
     fn endpoint(&self, provider: &str) -> Result<&Endpoint> {
         self.endpoints.iter().find(|e| e.name == provider)
             .ok_or_else(|| Error::InvalidInput(format!("unknown provider {provider}")))
+    }
+
+    /// The window a running llama.cpp server was started with. Its model list
+    /// carries no sizes, but `/props` says it, and it is the size in use, not the
+    /// one the model was trained for.
+    fn llamacpp_window(&self, endpoint: &Endpoint) -> u64 {
+        if let Some((at, n)) = self.windows.lock().unwrap().get(&endpoint.name) {
+            if at.elapsed() < CACHE_TTL {
+                return *n;
+            }
+        }
+        let root = endpoint.base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let n = self.agent(CONNECT_TIMEOUT).ok()
+            .and_then(|agent| agent.get(&format!("{root}/props")).call().ok())
+            .and_then(|mut r| r.body_mut().read_to_string().ok())
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .map_or(0, |props| props_window(&props));
+        self.windows.lock().unwrap().insert(endpoint.name.clone(), (Instant::now(), n));
+        n
     }
 
     fn key(&self, provider: &str) -> Result<String> {
@@ -218,6 +241,16 @@ impl ModelGateway for Gateway {
         self.config.get(DEFAULT_MODEL_KEY).ok().flatten()
     }
 
+    fn context_limit(&self, model: &str) -> u64 {
+        let Ok(endpoint) = self.resolve_provider(model) else { return 0 };
+        if endpoint.name == "llamacpp" {
+            return self.llamacpp_window(endpoint);
+        }
+        self.models().ok()
+            .and_then(|list| list.into_iter().find(|m| m.id == model))
+            .map_or(0, |m| m.context_limit)
+    }
+
     fn stream(
         &self,
         model: &str,
@@ -246,14 +279,28 @@ impl ModelGateway for Gateway {
             }),
         };
         let url = format!("{}/chat/completions", endpoint.base_url);
-        let response = authorized(self.agent(STREAM_TIMEOUT)?.post(&url), &key)
-            .header("Content-Type", "application/json")
-            .send_json(&body)
-            .map_err(http_error)?;
-        // Chunks are parsed line by line as the provider sends them, so the
-        // runner (and the screen) get each token when it is generated.
-        let reader = std::io::BufReader::new(response.into_body().into_reader());
-        Ok(Box::new(SseStream::new(reader, endpoint.dialect)))
+        let agent = self.agent(STREAM_TIMEOUT)?;
+        let dialect = endpoint.dialect;
+        Background::spawn(move |send| {
+            let response = authorized(agent.post(&url), &key)
+                .header("Content-Type", "application/json")
+                .send_json(&body);
+            // A failed request is the stream's only item; a good one is read
+            // line by line as the provider sends it, so the runner (and the
+            // screen) get each token when it is generated.
+            let items: Box<dyn Iterator<Item = Result<Chunk>>> = match response {
+                Ok(response) => Box::new(SseStream::new(
+                    std::io::BufReader::new(response.into_body().into_reader()),
+                    dialect,
+                )),
+                Err(e) => Box::new(std::iter::once(Err(http_error(e)))),
+            };
+            for item in items {
+                if !send(item) {
+                    break;
+                }
+            }
+        })
     }
 }
 
@@ -268,6 +315,11 @@ struct ModelEntry {
     id: String,
     #[serde(default)]
     context_window: Option<u64>,
+}
+
+/// `n_ctx` out of a llama.cpp `/props` reply, 0 when it is not there.
+fn props_window(props: &Value) -> u64 {
+    props["default_generation_settings"]["n_ctx"].as_u64().unwrap_or(0)
 }
 
 /// An OpenAI-compatible chat request. Tool definitions are wrapped as
@@ -503,6 +555,46 @@ fn parse_sse(raw: &str, dialect: Dialect) -> Vec<Result<Chunk>> {
     out
 }
 
+/// How long a stream waits for its next chunk before it says so.
+const IDLE_POLL: Duration = Duration::from_millis(200);
+
+/// A response read on its own thread, so the consumer is never stuck inside a
+/// blocking socket read: the request, the wait for the first byte and every
+/// later read happen there, and the consumer sees [`Chunk::Idle`] whenever
+/// nothing has arrived for a moment. That is what lets a cancel interrupt a
+/// model that is still reading a long prompt.
+///
+/// Dropping the stream drops the channel. The reader notices at the next chunk
+/// it delivers, stops, and closes the connection; a read already in progress
+/// ends when the server sends something or the stream timeout runs out.
+struct Background {
+    received: std::sync::mpsc::Receiver<Result<Chunk>>,
+}
+
+impl Background {
+    fn spawn(work: impl FnOnce(&dyn Fn(Result<Chunk>) -> bool) + Send + 'static) -> Result<Stream> {
+        let (sender, received) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("gateway-stream".into())
+            // `false` tells the reader nobody is listening any more.
+            .spawn(move || work(&|item| sender.send(item).is_ok()))
+            .map_err(|e| Error::Unavailable(format!("could not start the response reader: {e}")))?;
+        Ok(Box::new(Self { received }))
+    }
+}
+
+impl Iterator for Background {
+    type Item = Result<Chunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.received.recv_timeout(IDLE_POLL) {
+            Ok(item) => Some(item),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Ok(Chunk::Idle)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        }
+    }
+}
+
 /// The live body as an iterator of chunks: each `next` reads only as far as
 /// the next line that carries one.
 struct SseStream<R> {
@@ -621,6 +713,7 @@ impl ModelGateway for SharedGateway {
     fn connect(&mut self, p: &str, k: &str) -> Result<()> { self.0.connect_shared(p, k) }
     fn connect_shared(&self, p: &str, k: &str) -> Result<()> { self.0.connect_shared(p, k) }
     fn default_model(&self) -> Option<String> { self.0.default_model() }
+    fn context_limit(&self, m: &str) -> u64 { self.0.context_limit(m) }
     fn stream(&self, m: &str, msgs: &[SessionMessage], tools: &[Value]) -> Result<Stream> {
         self.0.stream(m, msgs, tools)
     }
@@ -756,6 +849,85 @@ mod tests {
             _ => None,
         }).collect();
         assert_eq!(ids, ["call_a", "call_a", "call_b", "call_a"]);
+    }
+
+    #[test]
+    fn the_window_comes_out_of_the_props_of_a_llama_server() {
+        assert_eq!(props_window(&json!({"default_generation_settings": {"n_ctx": 32768}})), 32768);
+        assert_eq!(props_window(&json!({})), 0, "a server that does not say has no window");
+    }
+
+    #[test]
+    fn a_local_servers_window_is_read_from_its_props_once() {
+        // A one-shot HTTP server standing in for llama-server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).unwrap();
+            let body = r#"{"default_generation_settings":{"n_ctx":16384}}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            String::from_utf8_lossy(&request[..n]).to_string()
+        });
+        let config = Mem::default();
+        ConfigStore::set(&config, LLAMACPP_URL_KEY, &format!("http://127.0.0.1:{port}/v1")).unwrap();
+        let gw = Gateway::new(Arc::new(Mem::default()), Arc::new(config));
+
+        assert_eq!(gw.context_limit("llamacpp/anything"), 16384);
+        // Asked again, it answers from memory: the server accepted one connection.
+        assert_eq!(gw.context_limit("llamacpp/anything"), 16384);
+        assert!(served.join().unwrap().starts_with("GET /props"), "the root, not /v1/props");
+    }
+
+    #[test]
+    fn a_silent_response_yields_idle_until_the_first_chunk_arrives() {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let mut stream = Background::spawn(move |send| {
+            // The provider is still reading the prompt: nothing to send yet.
+            wait.recv().ok();
+            send(Ok(Chunk::TextDelta("hi".into())));
+        }).unwrap();
+        assert!(matches!(stream.next(), Some(Ok(Chunk::Idle))), "a silent wait must not block");
+        assert!(matches!(stream.next(), Some(Ok(Chunk::Idle))));
+        go.send(()).unwrap();
+        loop {
+            match stream.next() {
+                Some(Ok(Chunk::Idle)) => continue,
+                Some(Ok(Chunk::TextDelta(t))) => { assert_eq!(t, "hi"); break; }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(stream.next().is_none(), "the stream ends when the reader does");
+    }
+
+    #[test]
+    fn dropping_the_stream_stops_the_reader() {
+        let (stopped, observed) = std::sync::mpsc::channel::<bool>();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let stream = Background::spawn(move |send| {
+            wait.recv().ok();
+            // Once the consumer is gone, delivering fails and the reader quits.
+            stopped.send(send(Ok(Chunk::TextDelta("late".into())))).ok();
+        }).unwrap();
+        drop(stream);
+        go.send(()).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(5)), Ok(false));
+    }
+
+    #[test]
+    fn a_failed_request_reaches_the_consumer_as_the_first_item() {
+        let mut stream = Background::spawn(|send| {
+            send(Err(Error::AuthRequired { provider: "p".into() }));
+        }).unwrap();
+        loop {
+            match stream.next() {
+                Some(Ok(Chunk::Idle)) => continue,
+                Some(Err(Error::AuthRequired { .. })) => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
     #[test]

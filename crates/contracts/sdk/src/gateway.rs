@@ -35,6 +35,11 @@ pub enum Chunk {
         output_tokens: u64,
     },
     Done,
+    /// Nothing has arrived yet. A stream that can wait a long time for its next
+    /// chunk (the model is still reading the prompt) yields this every so often,
+    /// so the consumer can look at its cancel flag instead of being stuck in the
+    /// read. It carries no content.
+    Idle,
 }
 
 /// Minimal stream abstraction: synchronous iterator of chunks. Component
@@ -59,6 +64,9 @@ pub trait ModelGateway: Send + Sync {
         )))
     }
     fn default_model(&self) -> Option<String>;
+
+    /// The model's context window in tokens, 0 when the provider does not say.
+    fn context_limit(&self, _model: &str) -> u64 { 0 }
 
     fn stream(
         &self,

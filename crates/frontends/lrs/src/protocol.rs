@@ -74,6 +74,9 @@ pub enum Event {
         turn_input: u64,
         #[serde(default)]
         turn_output: u64,
+        /// The model's window, 0 when the backend does not know it.
+        #[serde(default)]
+        context_limit: u64,
     },
 
     /// Narration from an orchestration extension — no single sub-agent to attach
@@ -422,12 +425,21 @@ pub struct ApiError {
     pub error: String,
 }
 
-/// Split a model ref the way the engine's `_split_ref` does: a `prefix:` that
-/// names a configured provider is the provider, and anything else is openrouter
-/// (whose refs are bare `vendor/model` ids).
+/// Split a model ref into its provider and the provider's own model id.
+///
+/// Two spellings name a provider. The engine's is `prefix:model`. The in-process
+/// gateway's is `provider/model`, which counts only for a provider that is
+/// connected: without a key `openai/gpt-4o` is just an OpenRouter id, which is
+/// how the gateway routes it. Anything else belongs to openrouter, whose refs are
+/// bare `vendor/model` ids.
 pub fn split_ref<'a>(ref_: &'a str, providers: &[Provider]) -> (String, &'a str) {
     if let Some((prov, mid)) = ref_.split_once(':') {
         if providers.iter().any(|p| p.name == prov) {
+            return (prov.to_string(), mid);
+        }
+    }
+    if let Some((prov, mid)) = ref_.split_once('/') {
+        if prov != "openrouter" && providers.iter().any(|p| p.name == prov && p.connected) {
             return (prov.to_string(), mid);
         }
     }
@@ -480,6 +492,22 @@ mod tests {
         assert_eq!(split_ref("z-ai/glm-4.6", &provs), ("openrouter".into(), "z-ai/glm-4.6"));
         // a prefix that isn't a configured provider is part of the model id
         assert_eq!(split_ref("weird:thing", &provs), ("openrouter".into(), "weird:thing"));
+    }
+
+    #[test]
+    fn a_slash_ref_belongs_to_its_provider_only_while_that_provider_is_connected() {
+        let provs = vec![
+            Provider { name: "llamacpp".into(), connected: true, ..Default::default() },
+            Provider { name: "openai".into(), connected: false, ..Default::default() },
+        ];
+        assert_eq!(
+            split_ref("llamacpp/inkling/Inkling-2-Mini-UD-Q4_K_M.gguf", &provs),
+            ("llamacpp".into(), "inkling/Inkling-2-Mini-UD-Q4_K_M.gguf"),
+        );
+        // No key for openai, so this is the OpenRouter id it has always been.
+        assert_eq!(split_ref("openai/gpt-4o", &provs), ("openrouter".into(), "openai/gpt-4o"));
+        let keyed = vec![Provider { name: "openai".into(), connected: true, ..Default::default() }];
+        assert_eq!(split_ref("openai/gpt-4o", &keyed), ("openai".into(), "gpt-4o"));
     }
 
     #[test]

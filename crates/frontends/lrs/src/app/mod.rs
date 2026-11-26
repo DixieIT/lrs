@@ -10,6 +10,7 @@ pub mod keys;
 pub mod log;
 pub mod paste;
 pub mod resume;
+pub mod shell;
 pub mod side;
 
 use anyhow::Result;
@@ -138,6 +139,13 @@ pub struct App {
     cwd: String,
     session_id: Option<String>,
     job_id: Option<String>,
+    /// The turn was asked to stop and has not ended yet. A second `^c` in that
+    /// state leaves instead of asking again, so a stuck cancel never traps you.
+    cancelling: bool,
+    /// Raised to stop the `!` command that is running, `None` when none is.
+    shell: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Commands run with `!` since the last turn: the next one tells the model.
+    shell_ran: Vec<shell::Ran>,
     /// Herdr pane id, forwarded per-run so the herdr plugin in serve can report
     /// agent state to this pane. `None` outside herdr.
     pane_id: Option<String>,
@@ -209,6 +217,7 @@ impl App {
             model: model.clone(),
             context_limit: health.context_limit,
             executor: health.executor.clone(),
+            hide_context: !cfg.status.context,
             ..Default::default()
         };
 
@@ -243,6 +252,9 @@ impl App {
             cwd,
             session_id: None,
             job_id: None,
+            cancelling: false,
+            shell: None,
+            shell_ran: Vec::new(),
             pane_id: std::env::var("HERDR_PANE_ID").ok().filter(|s| !s.is_empty()),
             rx: None,
             side_tx,
@@ -280,7 +292,15 @@ impl App {
     // ── submitting ────────────────────────────────────────────────────────────
 
     pub fn submit(&mut self) {
-        let raw = self.ed.take();
+        let shell = self.ed.shell_mode();
+        let typed = self.ed.take();
+        // Sending always ends the command prompt. The `!` is put back in front of
+        // the text, which is how the history keeps the command and how it is parsed.
+        self.ed.leave_shell();
+        if shell && typed.trim().is_empty() {
+            return;
+        }
+        let raw = if shell { format!("!{typed}") } else { typed };
         if raw.trim().is_empty() {
             return;
         }
@@ -292,6 +312,7 @@ impl App {
         self.touch();
         match commands::parse(&raw, &self.commands) {
             Command::Send(task) => self.start_turn(task),
+            Command::Shell(command) => self.run_shell(command),
             Command::Image => self.paste_image(),
             Command::Plugin { name, arg } => self.run_plugin_command(&name, &arg),
             Command::Registry { plugins } => self.open_registry_picker(plugins),
@@ -843,7 +864,10 @@ impl App {
         // What the transcript shows keeps the chips; what the model receives has
         // the pastes expanded and the images attached as their own content parts.
         let images = self.pastes.images_in(&shown);
-        let text = self.pastes.expand(&shown);
+        // What the user ran with `!` goes in front of what they say, and is kept
+        // until the turn has really started.
+        let ran = std::mem::take(&mut self.shell_ran);
+        let text = format!("{}{}", shell::preface(&ran), self.pastes.expand(&shown)).trim_end().to_string();
         let task = if images.is_empty() {
             serde_json::Value::String(text)
         } else {
@@ -901,6 +925,7 @@ impl App {
                 });
             }
             Err(e) => {
+                self.shell_ran = ran;
                 let base = self.client.base().to_string();
                 self.notice(format!("could not start the turn via {base}: {e}"), Level::Error)
             }
@@ -971,6 +996,10 @@ impl App {
         // a recalled prompt is an empty label. Sending it would put the literal
         // text "[Image #1]" in front of the model — a turn that looks like it
         // carries a screenshot and doesn't.
+        let (shell, entry) = match entry.strip_prefix('!') {
+            Some(command) => (true, command),
+            None => (false, entry),
+        };
         let (entry, dropped) = self.pastes.without_dead_images(entry);
         if dropped > 0 {
             let s = if dropped == 1 { "image is" } else { "images are" };
@@ -982,21 +1011,106 @@ impl App {
         } else {
             self.ed.set(&entry);
         }
+        if shell {
+            self.ed.enter_shell();
+        } else {
+            self.ed.leave_shell();
+        }
+    }
+
+    /// Run a `!` command off the UI thread, in the project directory. One at a
+    /// time: its block is how the result finds its place in the transcript.
+    fn run_shell(&mut self, command: String) {
+        if self.shell.is_some() {
+            self.notice("a command is already running — esc to stop it", Level::Warn);
+            return;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.shell = Some(stop.clone());
+        self.blocks.push(Block::Tool {
+            title: shell_title(&command),
+            body: None,
+            kind: block::body_kind("bash"),
+            failed: false,
+            started: Some(std::time::Instant::now()),
+            took: None,
+        });
+        self.follow = true;
+        self.touch();
+        let (tx, cwd) = (self.side_tx.clone(), self.cwd.clone());
+        std::thread::spawn(move || {
+            let result = shell::run(&cwd, &command, &stop);
+            side::deliver(&tx, Side::Shell { command, result });
+        });
+    }
+
+    /// Fill the command's block. A finished command is sent to the model as a
+    /// turn of its own; one that was stopped or never started told it nothing.
+    fn shell_finished(&mut self, command: String, result: Result<shell::ShellResult, String>) {
+        use shell::ShellResult;
+        self.shell = None;
+        if !self.busy() {
+            self.cancelling = false;
+        }
+        let (text, failed) = match &result {
+            Ok(ShellResult::Finished { text, failed }) => (text.clone(), *failed),
+            Ok(ShellResult::Stopped) => ("(stopped)".to_string(), true),
+            Err(e) => (e.clone(), true),
+        };
+        let title = shell_title(&command);
+        let slot = self.blocks.iter_mut().rev().find(
+            |b| matches!(b, Block::Tool { title: t, body: None, .. } if *t == title),
+        );
+        if let Some(Block::Tool { body, failed: slot_failed, started, took, .. }) = slot {
+            *body = Some(text.clone());
+            *slot_failed = failed;
+            *took = started.map(|at| at.elapsed());
+        }
+        if let Ok(ShellResult::Finished { .. }) = result {
+            self.shell_ran.push(shell::Ran { command, output: text });
+            // The output is the message: send it now instead of waiting for the
+            // next one. While a turn runs it is kept for the next turn instead.
+            if !self.busy() {
+                self.send_turn(String::new(), false);
+            }
+        }
+        self.follow = true;
+        // The transcript is redrawn only when its revision moves: without this
+        // the output stays unseen until the next keystroke happens to do it.
+        self.touch();
+    }
+
+    /// A turn or a `!` command is running: what `esc` and `^c` act on.
+    pub fn working(&self) -> bool {
+        self.busy() || self.shell.is_some()
     }
 
     pub fn cancel(&mut self) {
-        if let Some(job) = self.job_id.clone() {
+        let command = self.shell.as_ref().map(|stop| {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let turn = self.job_id.clone();
+        if let Some(job) = &turn {
             // ^c is the key you press when something is already wrong, so it is
             // the last one that may block on the server answering.
             let client = self.client.clone();
             let tx = self.side_tx.clone();
+            let job = job.clone();
             std::thread::spawn(move || {
                 if let Err(e) = client.cancel(&job) {
                     side::deliver(&tx, Side::CancelFailed(e.to_string()));
                 }
             });
+        }
+        if command.is_some() || turn.is_some() {
+            self.cancelling = true;
             self.notice("cancelling…", Level::Warn);
         }
+    }
+
+    /// A stop was requested for the turn or command that is still running.
+    pub fn cancelling(&self) -> bool {
+        self.cancelling
     }
 
     // ── streaming ─────────────────────────────────────────────────────────────
@@ -1022,6 +1136,7 @@ impl App {
         if done {
             self.rx = None;
             self.job_id = None;
+            self.cancelling = false;
             self.status.busy = false;
             // Only now, with `busy()` false again, or it would steer itself into
             // the job that just finished.
@@ -1190,6 +1305,7 @@ impl App {
                     }
                 }
                 Side::CancelFailed(e) => self.notice(format!("could not cancel: {e}"), Level::Error),
+                Side::Shell { command, result } => self.shell_finished(command, result),
                 Side::Context(result) => match result {
                     Ok(res) if res.error.is_none() => {
                         self.overlay = Some(Overlay::View(Viewer::new("Context", crate::ui::context::rows(&res.output))));
@@ -1321,7 +1437,12 @@ impl App {
             }
             // A plugin moved a panel mid-turn — a tool setting the goal, typically.
             Event::Widget { id, markup } => self.set_widget(&id, markup),
-            Event::Usage { context, .. } => self.status.context = context,
+            Event::Usage { context, context_limit, .. } => {
+                self.status.context = context;
+                if context_limit > 0 {
+                    self.status.context_limit = context_limit;
+                }
+            }
             Event::Phase { title } => self.notice(format!("▸ {title}"), Level::Info),
             Event::Log { message } => self.notice(format!("  {message}"), Level::Info),
             Event::JobFailed { error } => {
@@ -1644,6 +1765,16 @@ where
                 )),
                 panes.status,
             ),
+            // The mode is named under the prompt, where the model and cwd usually are.
+            None if view.ed.shell_mode() => f.render_widget(
+                ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
+                    ratatui::text::Span::styled(
+                        " shell mode",
+                        ratatui::style::Style::default().fg(view.theme.warn),
+                    ),
+                )),
+                panes.status,
+            ),
             None => crate::ui::status::draw(f, panes.status, &view.status, &view.theme),
         }
         // Last, and over everything: a modal that drew before the prompt would be
@@ -1713,7 +1844,7 @@ impl App {
     /// The two can't collide — a slash command occupies the whole prompt while
     /// an `@path` is a token inside one — so the leading character decides.
     pub fn menu_rows(&self) -> Vec<crate::ui::input::MenuRow> {
-        if self.ed.text().starts_with('/') {
+        if self.ed.text().starts_with('/') && !self.ed.shell_mode() {
             return crate::ui::input::menu_matches(self.ed.text(), &self.commands);
         }
         crate::ui::input::file_matches(self.ed.text(), self.ed.cursor(), self.files.list())
@@ -1735,6 +1866,11 @@ impl App {
         let typed = text.trim();
         !typed.is_empty() && self.menu_rows().iter().any(|r| r.applied(text).trim() == typed)
     }
+}
+
+/// A command typed with `!` is titled as the agent's own `bash` calls are.
+fn shell_title(command: &str) -> String {
+    block::tool_title("bash", &serde_json::json!({ "command": command }))
 }
 
 #[cfg(test)]
@@ -3238,10 +3374,65 @@ mod tests {
     }
 
     #[test]
+    fn the_model_picker_finds_a_group_and_a_fragment_typed_together() {
+        let mut a = app();
+        a.catalog.providers = vec![
+            Provider { name: "llamacpp".into(), connected: true, ..Default::default() },
+            Provider { name: "openrouter".into(), connected: true, ..Default::default() },
+        ];
+        a.catalog.models = vec![
+            "llamacpp/hy-local/x.gguf".into(),
+            "z-ai/glm-4.6".into(),
+            "tencent/hy4-flash".into(),
+        ];
+        let mut picker = Picker::new(picker::Kind::Model, "Select model", a.model_rows());
+        for c in "openrouter hy".chars() {
+            picker.insert(c);
+        }
+        assert_eq!(
+            picker.selected(), Some("tencent/hy4-flash"),
+            "`hy` alone would also fit the local model; the group word narrows it",
+        );
+    }
+
+    #[test]
+    fn a_local_servers_models_are_listed_under_it_not_under_openrouter() {
+        let mut a = app();
+        a.catalog.providers = vec![
+            Provider { name: "llamacpp".into(), connected: true, ..Default::default() },
+            Provider { name: "openrouter".into(), connected: true, ..Default::default() },
+        ];
+        a.catalog.models = vec![
+            "thinkingmachines/inkling-2-mini".into(),
+            "llamacpp/inkling/Inkling-2-Mini-UD-Q4_K_M.gguf".into(),
+        ];
+        let rows = a.model_rows();
+        let headings: Vec<&str> = rows.iter().filter(|r| r.id.is_none()).map(|r| r.label.as_str()).collect();
+        assert_eq!(headings, vec!["llamacpp", "openrouter"], "the local server has its own group");
+        let local = rows.iter()
+            .find(|r| r.id.as_deref() == Some("llamacpp/inkling/Inkling-2-Mini-UD-Q4_K_M.gguf"))
+            .unwrap();
+        assert_eq!(local.label.trim(), "inkling/Inkling-2-Mini-UD-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn a_reply_reports_the_window_and_how_much_of_it_is_used() {
+        let mut a = app();
+        a.status.context_limit = 0;
+        a.apply(Event::Usage { context: 9_000, turn_input: 8_000, turn_output: 1_000, context_limit: 32_768 });
+        assert_eq!(a.status.context, 9_000);
+        assert_eq!(a.status.context_limit, 32_768);
+
+        // A backend that does not know the window must not wipe one already known.
+        a.apply(Event::Usage { context: 10_000, turn_input: 0, turn_output: 0, context_limit: 0 });
+        assert_eq!(a.status.context_limit, 32_768);
+    }
+
+    #[test]
     fn the_context_limit_from_health_reaches_the_gauge() {
         let mut a = app();
         assert_eq!(a.status.context_limit, 200_000);
-        a.apply(Event::Usage { context: 20_000, turn_input: 0, turn_output: 0 });
+        a.apply(Event::Usage { context: 20_000, turn_input: 0, turn_output: 0, context_limit: 0 });
         let s = screen(&mut a, 70, 10);
         assert!(s[9].contains("20.0k/200.0k"), "status row was {:?}", s[9]);
     }
@@ -3271,6 +3462,166 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.rx = Some(rx);
         tx
+    }
+
+    #[test]
+    fn a_finished_command_fills_its_block_and_is_kept_for_the_next_turn() {
+        use shell::ShellResult;
+        let mut a = app();
+        a.blocks.clear();
+        a.shell = Some(Default::default());
+        a.blocks.push(Block::Tool {
+            title: shell_title("ls"), body: None, kind: Body::Plain, failed: false,
+            started: Some(std::time::Instant::now()), took: None,
+        });
+        a.shell_finished("ls".into(), Ok(ShellResult::Finished { text: "a.txt".into(), failed: false }));
+
+        assert!(a.shell.is_none(), "the command is over");
+        assert!(matches!(&a.blocks[0], Block::Tool { body: Some(b), failed: false, .. } if b == "a.txt"));
+        // Nothing listens on the test client's port, so the turn it starts here
+        // fails, and the output has to survive that.
+        assert!(matches!(a.blocks.last(), Some(Block::Notice { level: Level::Error, .. })),
+            "a finished command starts a turn");
+        assert_eq!(a.shell_ran.len(), 1);
+        assert_eq!(a.shell_ran[0].command, "ls");
+    }
+
+    #[test]
+    fn a_command_that_ends_during_a_turn_waits_for_the_next_one() {
+        use shell::ShellResult;
+        let mut a = app();
+        let _tx = make_busy(&mut a);
+        a.shell = Some(Default::default());
+        a.shell_finished("ls".into(), Ok(ShellResult::Finished { text: "a".into(), failed: false }));
+        assert!(!a.blocks.iter().any(|b| matches!(b, Block::Notice { level: Level::Error, .. })),
+            "starting a second turn would have failed here, and said so");
+        assert_eq!(a.shell_ran.len(), 1, "kept for the next turn");
+    }
+
+    #[test]
+    fn a_bang_on_an_empty_prompt_puts_the_bang_where_the_arrow_is() {
+        let mut a = app();
+        a.blocks.clear();
+        keys::tests::press_key(&mut a, '!');
+        for c in "ls -la".chars() {
+            keys::tests::press_key(&mut a, c);
+        }
+        assert_eq!(a.ed.text(), "ls -la", "the bang is the mode, not part of the text");
+        let rows = screen(&mut a, 60, 8);
+        let prompt = rows.iter().find(|l| l.contains("ls -la")).expect("the prompt is drawn");
+        assert!(prompt.starts_with("! ls -la"), "{prompt:?}");
+        assert!(rows.last().unwrap().contains("shell mode"), "the mode is named under the prompt: {rows:?}");
+
+        a.ed.leave_shell();
+        let rows = screen(&mut a, 60, 8);
+        let prompt = rows.iter().find(|l| l.contains("ls -la")).expect("the prompt is drawn");
+        assert!(prompt.starts_with("❯ "), "a message keeps the usual prompt: {prompt:?}");
+        assert!(!rows.last().unwrap().contains("shell mode"));
+    }
+
+    #[test]
+    fn a_command_is_run_and_remembered_with_its_bang() {
+        let mut a = app();
+        a.blocks.clear();
+        a.ed.enter_shell();
+        a.ed.set("echo hi");
+        a.submit();
+        assert!(!a.ed.shell_mode(), "sending ends the command prompt");
+        assert!(a.shell.is_some());
+        assert!(matches!(a.blocks.last(), Some(Block::Tool { title, .. }) if *title == shell_title("echo hi")));
+
+        a.recall("!echo hi");
+        assert!(a.ed.shell_mode());
+        assert_eq!(a.ed.text(), "echo hi");
+        a.recall("plain message");
+        assert!(!a.ed.shell_mode());
+    }
+
+    #[test]
+    fn the_command_menu_stays_closed_while_typing_a_command() {
+        let mut a = app();
+        a.ed.enter_shell();
+        a.ed.set("/usr/bin/env");
+        assert!(!a.menu_open(), "a path is not a slash command");
+    }
+
+    #[test]
+    fn an_empty_command_prompt_is_left_with_backspace_escape_or_ctrl_c() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        for leave in [KeyCode::Backspace, KeyCode::Esc] {
+            let mut a = app();
+            keys::tests::press_key(&mut a, '!');
+            assert!(a.ed.shell_mode());
+            keys::tests::press_code(&mut a, leave, KeyModifiers::NONE);
+            assert!(!a.ed.shell_mode());
+            assert!(!a.should_quit);
+        }
+        let mut a = app();
+        keys::tests::press_key(&mut a, '!');
+        keys::tests::press_code(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!a.ed.shell_mode() && !a.should_quit, "the first ^c leaves the mode, not the app");
+    }
+
+    #[test]
+    fn a_command_redraws_the_transcript_when_it_starts_and_when_it_ends() {
+        use shell::ShellResult;
+        let mut a = app();
+        a.shell = Some(Default::default());
+        a.blocks.push(Block::Tool {
+            title: shell_title("ls"), body: None, kind: Body::Plain, failed: false,
+            started: Some(std::time::Instant::now()), took: None,
+        });
+        let before = a.revision;
+        a.shell_finished("ls".into(), Ok(ShellResult::Finished { text: "a".into(), failed: false }));
+        assert_ne!(a.revision, before, "the result would stay invisible until the next key");
+
+        let started = a.revision;
+        a.run_shell("ls".into());
+        assert_ne!(a.revision, started, "the running command must show at once");
+    }
+
+    #[test]
+    fn a_stopped_or_unstartable_command_tells_the_model_nothing() {
+        use shell::ShellResult;
+        for result in [Ok(ShellResult::Stopped), Err("no shell".to_string())] {
+            let mut a = app();
+            a.shell = Some(Default::default());
+            a.shell_finished("sleep 9".into(), result);
+            assert!(a.shell_ran.is_empty());
+            assert!(a.shell.is_none());
+        }
+    }
+
+    #[test]
+    fn only_one_command_runs_at_a_time() {
+        let mut a = app();
+        let running: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+        a.shell = Some(running.clone());
+        let blocks = a.blocks.len();
+        a.run_shell("ls".into());
+        assert_eq!(a.blocks.len() - blocks, 1, "only the warning, no second block");
+        assert!(matches!(a.blocks.last(), Some(Block::Notice { .. })));
+    }
+
+    #[test]
+    fn escape_stops_a_running_command() {
+        let mut a = app();
+        let running: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+        a.shell = Some(running.clone());
+        assert!(a.working() && !a.busy(), "a command is not a turn");
+        keys::tests::press_esc(&mut a);
+        assert!(running.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(a.cancelling());
+    }
+
+    #[test]
+    fn a_turn_that_cannot_start_keeps_the_commands_for_the_next_one() {
+        let mut a = app();
+        a.shell_ran.push(shell::Ran { command: "ls".into(), output: "a.txt".into() });
+        // Nothing listens on the test client's port, so the turn never starts.
+        a.ed.set("what is in there?");
+        a.submit();
+        assert_eq!(a.shell_ran.len(), 1, "the output must not be lost with the failed turn");
     }
 
     #[test]

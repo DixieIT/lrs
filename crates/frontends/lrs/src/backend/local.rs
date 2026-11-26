@@ -323,8 +323,13 @@ impl ToolNames {
         match event {
             protocol::Event::TextDelta { text } => Some(Event::Token { text, run_id: None }),
             protocol::Event::Thinking { text } => Some(Event::Thinking { text, run_id: None }),
-            protocol::Event::Usage { input_tokens, output_tokens, context_limit } =>
-                Some(Event::Usage { context: context_limit, turn_input: input_tokens, turn_output: output_tokens }),
+            // What the next request will carry: the prompt just sent and the reply.
+            protocol::Event::Usage { input_tokens, output_tokens, context_limit } => Some(Event::Usage {
+                context: input_tokens + output_tokens,
+                turn_input: input_tokens,
+                turn_output: output_tokens,
+                context_limit,
+            }),
             protocol::Event::ToolCallStart { id, name, args } => {
                 self.calls.insert(id, (name.clone(), args.clone()));
                 Some(Event::ToolStarted { name, args, run_id: None })
@@ -501,6 +506,21 @@ mod tests {
         let positions: Vec<usize> = order.iter()
             .map(|l| report.iter().position(|r| r == l).unwrap_or(usize::MAX)).collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+    }
+
+    #[test]
+    fn usage_becomes_the_context_in_use_and_carries_the_window() {
+        let mut names = ToolNames::default();
+        let event = names.wire_event(protocol::Event::Usage {
+            input_tokens: 8_000, output_tokens: 500, context_limit: 32_768,
+        });
+        match event {
+            Some(Event::Usage { context, turn_input, turn_output, context_limit }) => {
+                assert_eq!(context, 8_500, "the next request carries the prompt and the reply");
+                assert_eq!((turn_input, turn_output, context_limit), (8_000, 500, 32_768));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     /// The two real packages together: a code-mode program calls the shell.

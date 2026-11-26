@@ -19,6 +19,9 @@ pub struct Editor {
     /// and it exists for exactly this: `/goal <objective>` should be ready to type
     /// over, not something to delete first.
     placeholder: Option<(usize, usize)>,
+    /// The text is a command to run, not a message. A mode of the prompt, shown
+    /// as `!` where the `❯` is, and not part of the text.
+    shell: bool,
 }
 
 impl Editor {
@@ -28,6 +31,18 @@ impl Editor {
 
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    pub fn shell_mode(&self) -> bool {
+        self.shell
+    }
+
+    pub fn enter_shell(&mut self) {
+        self.shell = true;
+    }
+
+    pub fn leave_shell(&mut self) {
+        self.shell = false;
     }
 
     pub fn clear(&mut self) {
@@ -290,19 +305,25 @@ fn advance(text: &str, start: usize, end: usize, col: usize) -> usize {
 
 /// Drawn before the first row; later rows align under it.
 const PROMPT: &str = "❯ ";
+/// The prompt while the text is a command to run. As wide as `PROMPT`, so the
+/// caret and the wrapping do not move when the mode changes.
+const SHELL_PROMPT: &str = "! ";
 
 /// Draw the prompt and place the terminal caret. ratatui hides the cursor unless
 /// a position is set every frame, so this must run on each draw or the input has
 /// no visible caret at all.
 pub fn draw(f: &mut Frame, area: Rect, ed: &Editor, placeholder: &str, theme: &Theme) {
-    let prompt = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    // The `!` stands where the `❯` does, so you can tell before pressing enter
+    // that this runs here instead of going to the model.
+    let (glyph, colour) = if ed.shell_mode() { (SHELL_PROMPT, theme.warn) } else { (PROMPT, theme.accent) };
+    let prompt = Style::default().fg(colour).add_modifier(Modifier::BOLD);
     let indent = " ".repeat(PROMPT.chars().count());
 
     let lines: Vec<Line> = if ed.is_empty() {
         vec![Line::from(vec![
-            Span::styled(PROMPT, prompt),
+            Span::styled(glyph, prompt),
             Span::styled(
-                placeholder.to_string(),
+                if ed.shell_mode() { String::new() } else { placeholder.to_string() },
                 Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC),
             ),
         ])]
@@ -320,7 +341,7 @@ pub fn draw(f: &mut Frame, area: Rect, ed: &Editor, placeholder: &str, theme: &T
             .enumerate()
             .map(|(i, r)| {
                 let lead =
-                    Span::styled(if i == 0 { PROMPT.to_string() } else { indent.clone() }, prompt);
+                    Span::styled(if i == 0 { glyph.to_string() } else { indent.clone() }, prompt);
                 let plain = Style::default().fg(theme.fg);
                 match ph {
                     Some((ps, pe)) => {

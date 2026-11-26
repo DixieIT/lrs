@@ -77,10 +77,25 @@ impl Tool for Bash {
         let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(1, MAX_TIMEOUT_MS);
+        self.run(command, &ctx.cwd, &|| ctx.is_cancelled(), timeout_ms)
+    }
+}
+
+impl Bash {
+    /// Run one command in `cwd` until it ends, runs out of `timeout_ms` or
+    /// `cancelled` says stop (then the error is `Cancelled`). This is what the
+    /// tool does once its arguments are checked, for callers that are not a
+    /// model: the same output, exit-code marks and process-tree cleanup.
+    pub fn run(
+        &self,
+        command: &str,
+        cwd: &str,
+        cancelled: &dyn Fn() -> bool,
+        timeout_ms: u64,
+    ) -> Result<ToolOutput> {
         let mut cmd = self.shell.command(command);
-        cmd.current_dir(&ctx.cwd);
-        let cancelled = ctx.cancellation_token.clone();
-        let finished = match process::run(cmd, &|| cancelled(), Duration::from_millis(timeout_ms)) {
+        cmd.current_dir(cwd);
+        let finished = match process::run(cmd, cancelled, Duration::from_millis(timeout_ms)) {
             Ok(finished) => finished,
             Err(e) => return Ok(ToolOutput::err(format!("could not start {}: {e}", self.shell.label()))),
         };

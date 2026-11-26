@@ -337,7 +337,7 @@ enum  Chunk         { TextDelta(String) | Thinking(String)
 
                     | ToolCallChunk{id,name:Option<String>,arguments_delta:String}
 
-                    | Usage{input_tokens:u64,output_tokens:u64} | Done }
+                    | Usage{input_tokens:u64,output_tokens:u64} | Done | Idle }
 
 type  Stream        = Box<dyn Iterator<Item = Result<Chunk>> + Send>
 
@@ -350,6 +350,8 @@ trait ModelGateway : Send + Sync {
     connect       (&mut self, provider : &str, key : &str) -> Result<()>
 
     default_model (&self) -> Option<String>
+
+    context_limit (&self, model : &str) -> u64
 
     stream        (&self, model : &str, messages : &[SessionMessage],
 

@@ -387,12 +387,17 @@ fn handle_key(app: &mut App, k: KeyEvent) {
             // Escalating, like a shell: stop what's running, else throw away what
             // you typed, and only quit once there is nothing left to interrupt.
             // Reaching the exit therefore always takes a deliberate second press
-            // after a non-empty prompt.
+            // after a non-empty prompt. While a stop is already under way the
+            // second press leaves: a turn that will not stop must not hold you.
             KeyCode::Char('c') => {
-                if app.busy() {
+                if app.working() && app.cancelling() {
+                    app.should_quit = true;
+                } else if app.working() {
                     app.cancel();
                 } else if !app.ed.is_empty() {
                     app.ed.clear();
+                } else if app.ed.shell_mode() {
+                    app.ed.leave_shell();
                 } else {
                     app.should_quit = true;
                 }
@@ -433,10 +438,12 @@ fn handle_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Tab if app.menu_open() => complete_menu(app),
         KeyCode::Esc => {
-            if app.busy() {
+            if app.working() {
                 app.cancel();
             } else if !app.ed.is_empty() {
                 app.ed.clear();
+            } else {
+                app.ed.leave_shell();
             }
         }
         KeyCode::Backspace => backspace(app),
@@ -460,6 +467,11 @@ fn handle_key(app: &mut App, k: KeyEvent) {
         KeyCode::PageDown => app.scroll_by(PAGE),
         KeyCode::Up => history_up(app),
         KeyCode::Down => history_down(app),
+        // `!` on an empty prompt turns it into a command prompt instead of typing.
+        KeyCode::Char('!') if app.ed.is_empty() && !app.ed.shell_mode() => {
+            app.ed.enter_shell();
+            app.hist.stop();
+        }
         KeyCode::Char(c) => {
             app.ed.insert(c);
             // Editing makes the recalled text the user's own draft.
@@ -487,6 +499,11 @@ fn paste_text(app: &mut App, text: &str) {
 /// `[Pasted 40 lines` — a label that no longer matches anything held, so the paste
 /// would silently stop being sent with no way to tell.
 fn backspace(app: &mut App) {
+    // Backspace on an empty command prompt takes the `!` back.
+    if app.ed.is_empty() && app.ed.shell_mode() {
+        app.ed.leave_shell();
+        return;
+    }
     let chip = app
         .pastes
         .chip_ending_at(app.ed.text(), app.ed.cursor())
@@ -604,6 +621,14 @@ pub(crate) mod tests {
     /// asserting on its effects shouldn't mean reimplementing it there.
     pub(crate) fn press_key(app: &mut App, c: char) {
         press(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+
+    pub(crate) fn press_code(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        press(app, code, mods);
+    }
+
+    pub(crate) fn press_esc(app: &mut App) {
+        press(app, KeyCode::Esc, KeyModifiers::NONE);
     }
 
     pub(crate) fn press_tab(app: &mut App) {
@@ -1163,6 +1188,21 @@ pub(crate) mod tests {
 
         press(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(a.should_quit, "second press on an empty prompt quits");
+    }
+
+    #[test]
+    fn a_second_ctrl_c_while_the_turn_is_stopping_quits() {
+        let mut a = app();
+        a.job_id = Some("job".into());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        a.rx = Some(rx);
+
+        press(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(a.cancelling(), "the first press asks the turn to stop");
+        assert!(!a.should_quit, "and does not leave yet");
+
+        press(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(a.should_quit, "a stop that has not landed must not trap the user");
     }
 
     #[test]

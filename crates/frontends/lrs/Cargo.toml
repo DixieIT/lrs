@@ -19,7 +19,7 @@ default = ["local-runtime", "legacy-http"]
 # exposes the same ports in-process. This is NOT the primary path.
 legacy-http = ["dep:ureq"]
 # Primary path: embed `runtime` directly in the frontend process.
-local-runtime = ["dep:runtime", "dep:gateway", "dep:runner-react", "dep:tool-executor-native", "dep:tool-executor-ptc", "dep:tool-permission", "dep:tools", "dep:system-prompt", "dep:agent-tool-presentation", "dep:tool-shell", "dep:session"]
+local-runtime = ["dep:runtime", "dep:gateway", "dep:runner-react", "dep:tool-executor-native", "dep:tool-executor-ptc", "dep:tool-permission", "dep:tools", "dep:system-prompt", "dep:agent-tool-presentation", "dep:session"]
 
 [dependencies]
 protocol = { workspace = true }
@@ -33,7 +33,7 @@ tool-permission = { workspace = true, optional = true }
 tools = { workspace = true, optional = true }
 system-prompt = { workspace = true, optional = true }
 agent-tool-presentation = { workspace = true, optional = true }
-tool-shell = { workspace = true, optional = true }
+tool-shell = { workspace = true }
 session = { workspace = true, optional = true }
 
 anyhow = { workspace = true }

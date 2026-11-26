@@ -27,6 +27,8 @@ pub struct Status {
     pub busy: bool,
     /// `ptc` (code mode) or `native`; empty when the backend does not say.
     pub executor: String,
+    /// The user turned the context gauge off in `lrs.toml`.
+    pub hide_context: bool,
 }
 
 fn seg<'a>(label: &str, value: String, theme: &Theme) -> Vec<Span<'a>> {
@@ -66,7 +68,7 @@ pub fn line(s: &Status, theme: &Theme) -> Line<'static> {
     if !s.effort.is_empty() {
         parts.push(seg("effort", s.effort.clone(), theme));
     }
-    if s.context > 0 {
+    if s.context > 0 && !s.hide_context {
         // Colour by pressure, so approaching auto-compact is visible without
         // reading the numbers.
         let (text, colour) = match s.context_limit {
@@ -133,6 +135,14 @@ mod tests {
     fn empty_segments_disappear_instead_of_showing_labels() {
         let s = Status { model: "opus".into(), ..Default::default() };
         assert_eq!(text(&s), "opus");
+    }
+
+    #[test]
+    fn the_context_gauge_can_be_hidden() {
+        let shown = Status { model: "m".into(), context: 8_000, context_limit: 32_000, ..Default::default() };
+        assert_eq!(text(&shown), "m · ctx 8.0k/32.0k 25%");
+        let hidden = Status { hide_context: true, ..shown };
+        assert_eq!(text(&hidden), "m");
     }
 
     #[test]

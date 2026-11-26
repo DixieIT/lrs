@@ -52,6 +52,8 @@ pub enum Command {
     /// Show the model-facing context of the next turn in a popup.
     Context,
     Quit,
+    /// `!cmd`: run it in the project directory and tell the model what it printed.
+    Shell(String),
     /// Not a command — send it to the agent as a turn.
     Send(String),
 }
@@ -118,6 +120,9 @@ impl Table {
 
 pub fn parse(raw: &str, table: &Table) -> Command {
     let input = raw.trim();
+    if let Some(command) = input.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {
+        return Command::Shell(command.to_string());
+    }
     if !input.starts_with('/') {
         return Command::Send(input.to_string());
     }
@@ -170,6 +175,7 @@ pub fn normalise_effort(arg: &str) -> Option<String> {
 /// The other half of `/help`. Not commands, so they are shown but never picked.
 pub const KEYS: &[(&str, &str)] = &[
     ("@", "complete a project file into the prompt"),
+    ("!cmd", "run a command here and send its output to the model"),
     ("enter", "send, or take the highlighted completion"),
     ("tab", "take the highlighted completion"),
     ("shift+enter · ^j", "newline"),
@@ -180,7 +186,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("^o", "expand or collapse all tool output"),
     ("^p · ^v", "attach the clipboard image (^v if your terminal passes it on)"),
     ("^w / ^u", "delete the word before the caret / clear the prompt"),
-    ("^c", "cancel the running turn, then quit"),
+    ("^c", "stop the turn, then clear the prompt, then quit; again while stopping quits now"),
     ("esc", "cancel the turn, or clear the prompt"),
     ("drag", "select and copy · shift+drag for the terminal's own selection"),
 ];
@@ -193,6 +199,14 @@ mod tests {
     /// Built-ins only — what most of these tests care about.
     fn t() -> Table {
         Table::builtin()
+    }
+
+    #[test]
+    fn a_bang_runs_a_command_and_a_lone_bang_is_just_text() {
+        assert_eq!(parse("!git status", &t()), Command::Shell("git status".into()));
+        assert_eq!(parse("  !  ls -la ", &t()), Command::Shell("ls -la".into()));
+        assert_eq!(parse("!", &t()), Command::Send("!".into()));
+        assert_eq!(parse("wow!", &t()), Command::Send("wow!".into()));
     }
 
     /// A table with the goal plugin merged in, exactly as the server reports it.

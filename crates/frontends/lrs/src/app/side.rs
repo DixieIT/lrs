@@ -59,6 +59,8 @@ pub enum Side {
     Copied(Result<usize, String>),
     /// `^c` reached the backend, but the job could not be cancelled.
     CancelFailed(String),
+    /// A `!` command ended, or could not be started.
+    Shell { command: String, result: Result<super::shell::ShellResult, String> },
 }
 
 /// Post a background result to the UI thread. The receiver goes away only when

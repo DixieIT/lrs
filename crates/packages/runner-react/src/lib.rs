@@ -313,6 +313,50 @@ impl ReactLoopAgent {
         }
     }
 
+    /// The controller's cancel flag becomes the turn's abort, so a cancel is
+    /// honoured wherever the loop polls, not only at step boundaries.
+    fn cancelled(tc: &TurnContext<'_>, abort: &Abort) -> bool {
+        if tc.controller.is_cancelled() {
+            abort.abort(CancelCause::User);
+        }
+        abort.signal()
+    }
+
+    /// Close the conversation when a step stops early so the next request is
+    /// valid: every call the model made gets a result, and a reply cut short is
+    /// kept, with a marker, instead of leaving user messages with no answer
+    /// between them. A failure before any text leaves nothing to keep: the
+    /// prompt can simply be sent again.
+    fn close_conversation(
+        &self,
+        messages: &mut Vec<SessionMessage>,
+        sink: &dyn EventSink,
+        cause: Interruption,
+        partial: &str,
+        unanswered: &[ToolCall],
+    ) {
+        let nothing_said = partial.is_empty() && cause == Interruption::Failed;
+        if unanswered.is_empty() && !nothing_said {
+            let marker = cause.reply_marker();
+            let content = if partial.is_empty() {
+                marker.to_string()
+            } else {
+                format!("{partial}\n\n{marker}")
+            };
+            add(messages, sink, SessionMessage {
+                id: String::new(), role: Role::Assistant, content, created_at: 0,
+                tool_calls: Vec::new(),
+            });
+        }
+        for call in unanswered {
+            add(messages, sink, SessionMessage {
+                id: call.id.clone(), role: Role::Tool, content: cause.tool_result().into(),
+                created_at: 0, tool_calls: Vec::new(),
+            });
+        }
+        self.state.lock().unwrap().turn_messages = messages.clone();
+    }
+
     fn model_for(&self, tc: &TurnContext<'_>) -> Result<String> {
         tc.model
             .map(str::to_string)
@@ -331,7 +375,8 @@ impl ReactLoopAgent {
         let mut ending: Option<TurnEndReason> = None;
 
         loop {
-            abort.throw_if_aborted()?;
+            // No abort check here: `step` polls before it calls the model and
+            // closes the conversation, which an early return would skip.
             {
                 let mut s = self.state.lock().unwrap();
                 Self::sync_controller(&mut s, tc, sink);
@@ -340,27 +385,33 @@ impl ReactLoopAgent {
                 let s = self.state.lock().unwrap();
                 match s.phase { Phase::Running { step, .. } => step + 1, _ => unreachable!() }
             };
-            let claimed = {
+            let (claimed, added) = {
                 let mut s = self.state.lock().unwrap();
                 let claimed = s.inbox.claim(turn, 16);
                 if step == 1 && !s.history_seeded {
                     s.turn_messages = tc.history.to_vec();
                     s.history_seeded = true;
-                    for m in &claimed {
-                        add(&mut s.turn_messages, sink, SessionMessage {
-                            id: String::new(),
-                            role: match m.source {
-                                SourceKind::User => Role::User,
-                                SourceKind::RuntimeContext => Role::System,
-                            },
-                            content: m.text.clone(),
-                            created_at: 0,
-                            tool_calls: Vec::new(),
-                        });
-                    }
                 }
-                claimed
+                // Every claimed message must reach the model: a steer synced
+                // after a tool round is claimed on step 2+, where it would
+                // otherwise be dropped with no later turn to carry it.
+                let added: Vec<SessionMessage> = claimed.iter().map(|m| SessionMessage {
+                    id: String::new(),
+                    role: match m.source {
+                        SourceKind::User => Role::User,
+                        SourceKind::RuntimeContext => Role::System,
+                    },
+                    content: m.text.clone(),
+                    created_at: 0,
+                    tool_calls: Vec::new(),
+                }).collect();
+                s.turn_messages.extend(added.iter().cloned());
+                (claimed, added)
             };
+            // Announced outside the state lock: a sink may call back into the agent.
+            for message in added {
+                sink.emit(Event::MessageAdded { message });
+            }
             let selection = self.model_for(tc)?;
 
             if claimed.is_empty() && tc.history.is_empty() && step == 1 {
@@ -393,7 +444,13 @@ impl ReactLoopAgent {
             }
 
             abort.throw_if_aborted()?;
-            let pending = self.state.lock().unwrap().inbox.next_step_len();
+            // A steer queued during the model call or its tools is not in the
+            // inbox yet; without this sync the turn would end and strand it.
+            let pending = {
+                let mut s = self.state.lock().unwrap();
+                Self::sync_controller(&mut s, tc, sink);
+                s.inbox.next_step_len()
+            };
             if ending.is_some() && pending == 0 {
                 break;
             }
@@ -431,15 +488,33 @@ impl ReactLoopAgent {
         loop {
             step_guard += 1;
             debug_assert!(step_guard < 1024, "step loop did not converge");
-            abort.throw_if_aborted()?;
-            let stream = tc.gateway.stream(selection, &messages, &definitions)?;
+            if Self::cancelled(tc, abort) {
+                self.close_conversation(&mut messages, sink, Interruption::Cancelled, "", &[]);
+                return Err(Error::Cancelled);
+            }
+            let mut stream = tc.gateway.stream(selection, &messages, &definitions)?;
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut text = String::new();
             let mut usage = None;
 
-            for chunk in stream {
-                abort.throw_if_aborted()?;
-                match chunk? {
+            // Cancelled before each pull, so no chunk is read after the user
+            // asked to stop; returning drops the stream and its connection.
+            loop {
+                if Self::cancelled(tc, abort) {
+                    self.close_conversation(&mut messages, sink, Interruption::Cancelled, &text, &[]);
+                    return Err(Error::Cancelled);
+                }
+                let Some(chunk) = stream.next() else { break };
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        self.close_conversation(&mut messages, sink, Interruption::Failed, &text, &[]);
+                        return Err(e);
+                    }
+                };
+                match chunk {
+                    // Nothing arrived yet: the loop only needs to look again.
+                    Chunk::Idle => {}
                     Chunk::TextDelta(t) => {
                         text.push_str(&t);
                         sink.emit(Event::TextDelta { text: t });
@@ -467,7 +542,8 @@ impl ReactLoopAgent {
 
             if let Some((input_tokens, output_tokens)) = usage {
                 sink.emit(Event::Usage {
-                    input_tokens, output_tokens, context_limit: 0,
+                    input_tokens, output_tokens,
+                    context_limit: tc.gateway.context_limit(selection),
                 });
             }
             if calls.is_empty() {
@@ -490,8 +566,13 @@ impl ReactLoopAgent {
                 }).collect(),
             });
 
-            for call in calls {
-                abort.throw_if_aborted()?;
+            for (index, call) in calls.iter().enumerate() {
+                if Self::cancelled(tc, abort) {
+                    self.close_conversation(
+                        &mut messages, sink, Interruption::Cancelled, "", &calls[index..],
+                    );
+                    return Err(Error::Cancelled);
+                }
                 let parsed = parse_arguments(&call.raw_args);
                 sink.emit(Event::ToolCallStart {
                     id: call.id.clone(),
@@ -502,9 +583,28 @@ impl ReactLoopAgent {
                 // told so, and nothing runs. Permission is enforced inside the
                 // executor, on the deciding operation.
                 let out: ToolOutput = match parsed {
-                    Ok(args) => tc.executor.dispatch(
+                    Ok(args) => match tc.executor.dispatch(
                         &call.name, args, tc.tools, &tc.tool_context, tc.permission,
-                    )?,
+                    ) {
+                        Ok(out) => out,
+                        // The tool was stopped: its call, and every call after
+                        // it, is answered so the conversation stays valid.
+                        Err(Error::Cancelled) => {
+                            sink.emit(Event::ToolCallEnd {
+                                id: call.id.clone(), output: TOOL_INTERRUPTED.into(), failed: true,
+                            });
+                            self.close_conversation(
+                                &mut messages, sink, Interruption::Cancelled, "", &calls[index..],
+                            );
+                            return Err(Error::Cancelled);
+                        }
+                        Err(e) => {
+                            self.close_conversation(
+                                &mut messages, sink, Interruption::Failed, "", &calls[index..],
+                            );
+                            return Err(e);
+                        }
+                    },
                     Err(reason) => ToolOutput::err(reason),
                 };
                 // The frontend gets the whole output; the model gets it as the
@@ -514,7 +614,7 @@ impl ReactLoopAgent {
                     id: call.id.clone(), output: out.content, failed: out.is_error,
                 });
                 add(&mut messages, sink, SessionMessage {
-                    id: call.id, role: Role::Tool, content: for_model, created_at: 0,
+                    id: call.id.clone(), role: Role::Tool, content: for_model, created_at: 0,
                     tool_calls: Vec::new(),
                 });
             }
@@ -580,6 +680,31 @@ impl AgentRunner for ReactLoopAgent {
             }
         }
         outcome
+    }
+}
+
+/// What the model reads where the user cut a reply or a tool short. The
+/// conversation keeps strict alternation and no call is left unanswered.
+const REPLY_INTERRUPTED: &str = "[Request interrupted by user]";
+const TOOL_INTERRUPTED: &str = "[Tool execution interrupted by user]";
+const REPLY_FAILED: &str = "[Reply interrupted by an error]";
+const TOOL_FAILED: &str = "[Tool execution failed]";
+
+/// Why a step stopped before it could finish what the model asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interruption {
+    /// The user stopped it.
+    Cancelled,
+    /// The model call or a tool failed; the turn ends with that error.
+    Failed,
+}
+
+impl Interruption {
+    fn reply_marker(self) -> &'static str {
+        match self { Self::Cancelled => REPLY_INTERRUPTED, Self::Failed => REPLY_FAILED }
+    }
+    fn tool_result(self) -> &'static str {
+        match self { Self::Cancelled => TOOL_INTERRUPTED, Self::Failed => TOOL_FAILED }
     }
 }
 
@@ -755,11 +880,29 @@ mod tests {
     impl EventSink for CollectSink {
         fn emit(&self, event: Event) { self.events.lock().unwrap().push(event); }
     }
+    impl CollectSink {
+        /// What the conversation gained, as (role, id, content).
+        fn messages(&self) -> Vec<(Role, String, String)> {
+            self.events.lock().unwrap().iter().filter_map(|e| match e {
+                Event::MessageAdded { message } =>
+                    Some((message.role.clone(), message.id.clone(), message.content.clone())),
+                _ => None,
+            }).collect()
+        }
+    }
 
-    fn context<'a>(gw: &'a ScriptedGateway, ctrl: &'a TestController) -> TurnContext<'a> {
+    fn context<'a>(gw: &'a dyn ModelGateway, ctrl: &'a TestController) -> TurnContext<'a> {
+        context_with(gw, ctrl, &[&EchoTool])
+    }
+
+    fn context_with<'a>(
+        gw: &'a dyn ModelGateway,
+        ctrl: &'a TestController,
+        tools: &'a [&'a dyn Tool],
+    ) -> TurnContext<'a> {
         TurnContext {
             session_id: "s1", cwd: ".", history: &[], gateway: gw,
-            tools: &[&EchoTool], model: Some("test-model"), effort: None,
+            tools, model: Some("test-model"), effort: None,
             controller: Arc::new(ctrl.clone()),
             executor: &TestExecutor, permission: &allow_all, presentation: &Capped,
             tool_context: ToolContext {
@@ -786,6 +929,344 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, Event::ToolCallEnd { output, .. } if output == "hello")));
         assert!(events.iter().any(|e| matches!(e, Event::TextDelta { text } if text == "done")));
         assert_eq!(gw.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_steer_queued_during_the_final_model_call_is_not_stranded() {
+        // The steer lands after the last step's own drain and before the turn
+        // would end. It must be synced, claimed on a later step and shown to
+        // the model, not left in the controller for the next run.
+        struct LateSteerGateway {
+            calls: AtomicUsize,
+            steers: Arc<Mutex<Vec<String>>>,
+            saw_steer: Arc<AtomicBool>,
+        }
+        impl ModelGateway for LateSteerGateway {
+            fn id(&self) -> &str { "late-steer" }
+            fn providers(&self) -> Result<Vec<ProviderInfo>> { Ok(vec![]) }
+            fn models(&self) -> Result<Vec<ModelInfo>> { Ok(vec![]) }
+            fn connect(&mut self, _: &str, _: &str) -> Result<()> { Ok(()) }
+            fn default_model(&self) -> Option<String> { Some("test-model".into()) }
+            fn stream(&self, _: &str, messages: &[SessionMessage], _: &[Value]) -> Result<Stream> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if messages.iter().any(|m| m.content == "late note") {
+                    self.saw_steer.store(true, Ordering::SeqCst);
+                }
+                if n == 0 {
+                    self.steers.lock().unwrap().push("late note".into());
+                }
+                Ok(Box::new(vec![Ok(Chunk::TextDelta("done".into())), Ok(Chunk::Done)].into_iter()))
+            }
+        }
+
+        let ctrl = TestController::default();
+        let gw = LateSteerGateway {
+            calls: AtomicUsize::new(0),
+            steers: ctrl.steers.clone(),
+            saw_steer: Arc::new(AtomicBool::new(false)),
+        };
+        let sink = CollectSink::default();
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        agent.run(&context(&gw, &ctrl), &sink).unwrap();
+
+        assert_eq!(gw.calls.load(Ordering::SeqCst), 2, "the steer must cost one more step");
+        assert!(gw.saw_steer.load(Ordering::SeqCst), "the model must receive the steer");
+        assert!(ctrl.steers.lock().unwrap().is_empty(), "nothing is left for the next run");
+        let announced: Vec<String> = sink.events.lock().unwrap().iter().filter_map(|e| match e {
+            Event::Steered { text } => Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(announced, vec!["late note"]);
+    }
+
+    #[test]
+    fn a_cancel_during_the_stream_stops_reading_it() {
+        struct CountingGateway { pulled: Arc<AtomicUsize> }
+        impl ModelGateway for CountingGateway {
+            fn id(&self) -> &str { "counting" }
+            fn providers(&self) -> Result<Vec<ProviderInfo>> { Ok(vec![]) }
+            fn models(&self) -> Result<Vec<ModelInfo>> { Ok(vec![]) }
+            fn connect(&mut self, _: &str, _: &str) -> Result<()> { Ok(()) }
+            fn default_model(&self) -> Option<String> { Some("test-model".into()) }
+            fn stream(&self, _: &str, _: &[SessionMessage], _: &[Value]) -> Result<Stream> {
+                let pulled = self.pulled.clone();
+                Ok(Box::new(std::iter::from_fn(move || {
+                    let n = pulled.fetch_add(1, Ordering::SeqCst) + 1;
+                    (n <= 5).then(|| Ok(Chunk::TextDelta(format!("chunk{n}"))))
+                })))
+            }
+        }
+        // Flips the cancel flag once the second chunk has been shown.
+        struct CancelOnSecond { cancelled: Arc<AtomicBool>, shown: AtomicUsize, inner: CollectSink }
+        impl EventSink for CancelOnSecond {
+            fn emit(&self, event: Event) {
+                if matches!(event, Event::TextDelta { .. })
+                    && self.shown.fetch_add(1, Ordering::SeqCst) + 1 == 2
+                {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                }
+                self.inner.emit(event);
+            }
+        }
+        impl CancelOnSecond {
+            fn messages(&self) -> Vec<(Role, String, String)> { self.inner.messages() }
+        }
+
+        let ctrl = TestController::default();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let gw = CountingGateway { pulled: pulled.clone() };
+        let sink = CancelOnSecond { cancelled: ctrl.cancelled.clone(), shown: AtomicUsize::new(0), inner: CollectSink::default() };
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        let outcome = agent.run(&context(&gw, &ctrl), &sink);
+
+        assert!(matches!(outcome, Err(Error::Cancelled)), "got {outcome:?}");
+        assert_eq!(pulled.load(Ordering::SeqCst), 2, "no chunk may be read after the cancel");
+        assert_eq!(
+            sink.messages(),
+            vec![
+                (Role::User, String::new(), "go".to_string()),
+                (Role::Assistant, String::new(), format!("chunk1chunk2\n\n{REPLY_INTERRUPTED}")),
+            ],
+            "what was said is kept, marked as cut short",
+        );
+    }
+
+    #[test]
+    fn a_cancel_before_any_text_still_answers_the_user() {
+        struct SilentGateway;
+        impl ModelGateway for SilentGateway {
+            fn id(&self) -> &str { "silent" }
+            fn providers(&self) -> Result<Vec<ProviderInfo>> { Ok(vec![]) }
+            fn models(&self) -> Result<Vec<ModelInfo>> { Ok(vec![]) }
+            fn connect(&mut self, _: &str, _: &str) -> Result<()> { Ok(()) }
+            fn default_model(&self) -> Option<String> { Some("test-model".into()) }
+            fn stream(&self, _: &str, _: &[SessionMessage], _: &[Value]) -> Result<Stream> {
+                panic!("a cancelled turn must not call the model");
+            }
+        }
+        let ctrl = TestController::default();
+        ctrl.cancelled.store(true, Ordering::SeqCst);
+        let sink = CollectSink::default();
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        let outcome = agent.run(&context(&SilentGateway, &ctrl), &sink);
+
+        assert!(matches!(outcome, Err(Error::Cancelled)), "got {outcome:?}");
+        let roles: Vec<Role> = sink.messages().into_iter().map(|m| m.0).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant], "the prompt is never left unanswered");
+    }
+
+    /// A model that asks for the named tools in one reply, then answers.
+    struct CallsGateway { names: Vec<&'static str>, calls: AtomicUsize }
+    impl ModelGateway for CallsGateway {
+        fn id(&self) -> &str { "calls" }
+        fn providers(&self) -> Result<Vec<ProviderInfo>> { Ok(vec![]) }
+        fn models(&self) -> Result<Vec<ModelInfo>> { Ok(vec![]) }
+        fn connect(&mut self, _: &str, _: &str) -> Result<()> { Ok(()) }
+        fn default_model(&self) -> Option<String> { Some("test-model".into()) }
+        fn stream(&self, _: &str, _: &[SessionMessage], _: &[Value]) -> Result<Stream> {
+            assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0, "the turn must end after the cancel");
+            let chunks: Vec<Result<Chunk>> = self.names.iter().enumerate().map(|(i, name)| {
+                Ok(Chunk::ToolCallChunk {
+                    id: format!("c{}", i + 1), name: Some((*name).into()), arguments_delta: "{}".into(),
+                })
+            }).chain(std::iter::once(Ok(Chunk::Done))).collect();
+            Ok(Box::new(chunks.into_iter()))
+        }
+    }
+
+    /// Runs one tool that cancels the turn, and one that must then never run.
+    struct CancelTool { name: &'static str, cancelled: Arc<AtomicBool>, fail: bool }
+    impl Tool for CancelTool {
+        fn name(&self) -> &str { self.name }
+        fn description(&self) -> &str { "cancels the turn while it runs" }
+        fn parameters_schema(&self) -> Value { json!({"type":"object"}) }
+        fn execute(&self, _: Value, _: &ToolContext) -> Result<ToolOutput> {
+            self.cancelled.store(true, Ordering::SeqCst);
+            if self.fail { Err(Error::Cancelled) } else { Ok(ToolOutput::ok("ran")) }
+        }
+    }
+
+    fn cancelled_tool_round(fail: bool) -> Vec<(Role, String, String)> {
+        let ctrl = TestController::default();
+        let first = CancelTool { name: "first", cancelled: ctrl.cancelled.clone(), fail };
+        let second = EchoTool;
+        let tools: [&dyn Tool; 2] = [&first, &second];
+        let gw = CallsGateway { names: vec!["first", "echo", "echo"], calls: AtomicUsize::new(0) };
+        let sink = CollectSink::default();
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        let outcome = agent.run(&context_with(&gw, &ctrl, &tools), &sink);
+        assert!(matches!(outcome, Err(Error::Cancelled)), "got {outcome:?}");
+        sink.messages()
+    }
+
+    /// A model that says `said`, then fails, or never says anything.
+    struct FailingGateway { said: Vec<&'static str> }
+    impl ModelGateway for FailingGateway {
+        fn id(&self) -> &str { "failing" }
+        fn providers(&self) -> Result<Vec<ProviderInfo>> { Ok(vec![]) }
+        fn models(&self) -> Result<Vec<ModelInfo>> { Ok(vec![]) }
+        fn connect(&mut self, _: &str, _: &str) -> Result<()> { Ok(()) }
+        fn default_model(&self) -> Option<String> { Some("test-model".into()) }
+        fn stream(&self, _: &str, _: &[SessionMessage], _: &[Value]) -> Result<Stream> {
+            let chunks: Vec<Result<Chunk>> = self.said.iter()
+                .map(|t| Ok(Chunk::TextDelta((*t).into())))
+                .chain(std::iter::once(Err(Error::Unavailable("connection lost".into()))))
+                .collect();
+            Ok(Box::new(chunks.into_iter()))
+        }
+    }
+
+    fn failed_stream(said: Vec<&'static str>) -> (Result<()>, Vec<(Role, String, String)>) {
+        let ctrl = TestController::default();
+        let sink = CollectSink::default();
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        let outcome = agent.run(&context(&FailingGateway { said }, &ctrl), &sink);
+        (outcome, sink.messages())
+    }
+
+    #[test]
+    fn a_stream_that_fails_after_some_text_keeps_the_text_with_a_marker() {
+        let (outcome, messages) = failed_stream(vec!["Rome ", "was"]);
+        assert!(matches!(outcome, Err(Error::Unavailable(_))), "got {outcome:?}");
+        assert_eq!(messages, vec![
+            (Role::User, String::new(), "go".to_string()),
+            (Role::Assistant, String::new(), format!("Rome was\n\n{REPLY_FAILED}")),
+        ]);
+    }
+
+    #[test]
+    fn a_stream_that_fails_before_any_text_leaves_only_the_prompt() {
+        let (outcome, messages) = failed_stream(vec![]);
+        assert!(matches!(outcome, Err(Error::Unavailable(_))), "got {outcome:?}");
+        assert_eq!(messages, vec![(Role::User, String::new(), "go".to_string())],
+            "nothing to keep: the prompt can be sent again");
+    }
+
+    #[test]
+    fn a_tool_that_fails_leaves_no_call_without_a_result() {
+        struct BrokenTool;
+        impl Tool for BrokenTool {
+            fn name(&self) -> &str { "broken" }
+            fn description(&self) -> &str { "always fails" }
+            fn parameters_schema(&self) -> Value { json!({"type":"object"}) }
+            fn execute(&self, _: Value, _: &ToolContext) -> Result<ToolOutput> {
+                Err(Error::Internal("disk gone".into()))
+            }
+        }
+        let ctrl = TestController::default();
+        let tools: [&dyn Tool; 2] = [&BrokenTool, &EchoTool];
+        let gw = CallsGateway { names: vec!["broken", "echo"], calls: AtomicUsize::new(0) };
+        let sink = CollectSink::default();
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        let outcome = agent.run(&context_with(&gw, &ctrl, &tools), &sink);
+
+        assert!(matches!(outcome, Err(Error::Internal(_))), "got {outcome:?}");
+        let results: Vec<(String, String)> = sink.messages().into_iter()
+            .filter(|m| m.0 == Role::Tool).map(|m| (m.1, m.2)).collect();
+        assert_eq!(results, vec![
+            ("c1".to_string(), TOOL_FAILED.to_string()),
+            ("c2".to_string(), TOOL_FAILED.to_string()),
+        ]);
+    }
+
+    #[test]
+    fn a_cancel_is_honoured_while_the_model_has_sent_nothing() {
+        // The model is still reading the prompt: the stream only says "idle".
+        struct IdleGateway { pulled: Arc<AtomicUsize>, cancelled: Arc<AtomicBool> }
+        impl ModelGateway for IdleGateway {
+            fn id(&self) -> &str { "idle" }
+            fn providers(&self) -> Result<Vec<ProviderInfo>> { Ok(vec![]) }
+            fn models(&self) -> Result<Vec<ModelInfo>> { Ok(vec![]) }
+            fn connect(&mut self, _: &str, _: &str) -> Result<()> { Ok(()) }
+            fn default_model(&self) -> Option<String> { Some("test-model".into()) }
+            fn stream(&self, _: &str, _: &[SessionMessage], _: &[Value]) -> Result<Stream> {
+                let (pulled, cancelled) = (self.pulled.clone(), self.cancelled.clone());
+                Ok(Box::new(std::iter::from_fn(move || {
+                    // The user presses escape during the third wait.
+                    if pulled.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                        cancelled.store(true, Ordering::SeqCst);
+                    }
+                    Some(Ok(Chunk::Idle))
+                })))
+            }
+        }
+        let ctrl = TestController::default();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let gw = IdleGateway { pulled: pulled.clone(), cancelled: ctrl.cancelled.clone() };
+        let sink = CollectSink::default();
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        let outcome = agent.run(&context(&gw, &ctrl), &sink);
+
+        assert!(matches!(outcome, Err(Error::Cancelled)), "got {outcome:?}");
+        assert_eq!(pulled.load(Ordering::SeqCst), 3, "stops at the first look after the cancel");
+        assert_eq!(sink.messages(), vec![
+            (Role::User, String::new(), "go".to_string()),
+            (Role::Assistant, String::new(), REPLY_INTERRUPTED.to_string()),
+        ]);
+    }
+
+    #[test]
+    fn usage_carries_the_window_the_gateway_reports() {
+        struct WindowGateway;
+        impl ModelGateway for WindowGateway {
+            fn id(&self) -> &str { "window" }
+            fn providers(&self) -> Result<Vec<ProviderInfo>> { Ok(vec![]) }
+            fn models(&self) -> Result<Vec<ModelInfo>> { Ok(vec![]) }
+            fn connect(&mut self, _: &str, _: &str) -> Result<()> { Ok(()) }
+            fn default_model(&self) -> Option<String> { Some("test-model".into()) }
+            fn context_limit(&self, model: &str) -> u64 { if model == "test-model" { 8_192 } else { 0 } }
+            fn stream(&self, _: &str, _: &[SessionMessage], _: &[Value]) -> Result<Stream> {
+                let chunks: Vec<Result<Chunk>> = vec![
+                    Ok(Chunk::TextDelta("hi".into())),
+                    Ok(Chunk::Usage { input_tokens: 100, output_tokens: 5 }),
+                    Ok(Chunk::Done),
+                ];
+                Ok(Box::new(chunks.into_iter()))
+            }
+        }
+        let ctrl = TestController::default();
+        let sink = CollectSink::default();
+        let agent = ReactLoopAgent::new("s1", 0);
+        agent.followup(UserMessage::user("go"));
+        agent.run(&context(&WindowGateway, &ctrl), &sink).unwrap();
+
+        let usage: Vec<(u64, u64, u64)> = sink.events.lock().unwrap().iter().filter_map(|e| match e {
+            Event::Usage { input_tokens, output_tokens, context_limit } =>
+                Some((*input_tokens, *output_tokens, *context_limit)),
+            _ => None,
+        }).collect();
+        assert_eq!(usage, vec![(100, 5, 8_192)]);
+    }
+
+    #[test]
+    fn a_cancel_between_tool_calls_answers_the_ones_that_did_not_run() {
+        let messages = cancelled_tool_round(false);
+        let results: Vec<(String, String)> = messages.into_iter()
+            .filter(|m| m.0 == Role::Tool).map(|m| (m.1, m.2)).collect();
+        assert_eq!(results, vec![
+            ("c1".to_string(), "ran".to_string()),
+            ("c2".to_string(), TOOL_INTERRUPTED.to_string()),
+            ("c3".to_string(), TOOL_INTERRUPTED.to_string()),
+        ]);
+    }
+
+    #[test]
+    fn a_tool_stopped_by_the_cancel_and_the_calls_after_it_are_answered() {
+        let messages = cancelled_tool_round(true);
+        let results: Vec<(String, String)> = messages.into_iter()
+            .filter(|m| m.0 == Role::Tool).map(|m| (m.1, m.2)).collect();
+        assert_eq!(results, vec![
+            ("c1".to_string(), TOOL_INTERRUPTED.to_string()),
+            ("c2".to_string(), TOOL_INTERRUPTED.to_string()),
+            ("c3".to_string(), TOOL_INTERRUPTED.to_string()),
+        ], "every call the model made has exactly one result");
     }
 
     #[test]

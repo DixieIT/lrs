@@ -78,9 +78,50 @@ impl Row {
         self
     }
 
-    fn matches(&self, q: &str) -> bool {
-        self.label.to_lowercase().contains(q) || self.hay.contains(q)
+    /// Everything the search reads for this row: its group's name and extra text,
+    /// then its own. So `openrouter hy` finds the `hy` models of that group.
+    fn haystack(&self, group: Option<&Row>) -> String {
+        let mut text = String::new();
+        if let Some(g) = group {
+            text.push_str(&format!("{} {} ", g.label.to_lowercase(), g.hay));
+        }
+        text.push_str(&format!("{} {}", self.label.to_lowercase(), self.hay));
+        text
     }
+}
+
+/// How well `terms` fit `hay`, lower being better; `None` when one does not fit.
+///
+/// Every whitespace-separated term has to be there, in any order. A term fits as
+/// a substring of anything searchable, or failing that as scattered letters in
+/// order inside the row's own label (`gm4` finds `gemini-4`). Scattered letters
+/// are not tried across the group's name and address: spread over that much text
+/// almost anything would fit. The more spread out the letters, the worse the score.
+fn fuzzy_score(terms: &[String], hay: &str, label: &str) -> Option<usize> {
+    let mut total = 0;
+    for term in terms {
+        if hay.contains(term.as_str()) {
+            continue;
+        }
+        let mut wanted = term.chars();
+        let mut next = wanted.next();
+        let (mut first, mut last) = (None, 0);
+        for (at, c) in label.chars().enumerate() {
+            if Some(c) == next {
+                first.get_or_insert(at);
+                last = at;
+                next = wanted.next();
+                if next.is_none() {
+                    break;
+                }
+            }
+        }
+        if next.is_some() {
+            return None;
+        }
+        total += last + 1 - first.unwrap_or(0) - term.chars().count() + 1;
+    }
+    Some(total)
 }
 
 /// Rows shown at once before the list scrolls.
@@ -158,18 +199,20 @@ impl Picker {
             .and_then(|&i| self.rows[i].id.as_deref())
     }
 
-    /// Indices of the rows the query keeps. A heading survives only if at least one
-    /// of its children does; a heading that itself matches keeps all of them.
+    /// Indices of the rows the query keeps, best fit first within each group. A
+    /// heading survives only if at least one of its children does, and its own
+    /// text counts for every child.
     fn filtered(&self) -> Vec<usize> {
-        let q = self.query.trim().to_lowercase();
-        if q.is_empty() {
+        let query = self.query.to_lowercase();
+        let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
+        if terms.is_empty() {
             return (0..self.rows.len()).collect();
         }
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.rows.len() {
             if !self.rows[i].is_heading() {
-                if self.rows[i].matches(&q) {
+                if fuzzy_score(&terms, &self.rows[i].haystack(None), &self.rows[i].label.to_lowercase()).is_some() {
                     out.push(i);
                 }
                 i += 1;
@@ -180,13 +223,17 @@ impl Picker {
             while end < self.rows.len() && !self.rows[end].is_heading() {
                 end += 1;
             }
-            let whole_group = self.rows[i].matches(&q);
-            let kids: Vec<usize> = (start..end)
-                .filter(|&j| whole_group || self.rows[j].matches(&q))
+            let mut kids: Vec<(usize, usize)> = (start..end)
+                .filter_map(|j| {
+                    let row = &self.rows[j];
+                    fuzzy_score(&terms, &row.haystack(Some(&self.rows[i])), &row.label.to_lowercase())
+                        .map(|s| (s, j))
+                })
                 .collect();
+            kids.sort();
             if !kids.is_empty() {
                 out.push(i);
-                out.extend(kids);
+                out.extend(kids.into_iter().map(|(_, j)| j));
             }
             i = end;
         }
@@ -390,6 +437,61 @@ mod tests {
         let vis = p.filtered();
         assert_eq!(vis.len(), 2, "the opencode-go heading and its one match");
         assert_eq!(p.selected(), Some("opencode-go:gpt-5.6-luna"));
+    }
+
+    fn models() -> Picker {
+        let rows = vec![
+            Row::heading("llamacpp").hay("llamacpp http://127.0.0.1:8080/v1"),
+            Row::item("llamacpp/inkling/Q4.gguf", "  inkling/Q4.gguf").hay("llamacpp llamacpp/inkling/Q4.gguf"),
+            Row::heading("openrouter").hay("openrouter https://openrouter.ai/api/v1"),
+            Row::item("google/gemini-4-neon", "  google/gemini-4-neon").hay("openrouter google/gemini-4-neon"),
+            Row::item("tencent/hy4-flash", "  tencent/hy4-flash").hay("openrouter tencent/hy4-flash"),
+            Row::item("tencent/hy4-pro", "  tencent/hy4-pro").hay("openrouter tencent/hy4-pro"),
+        ];
+        Picker::new(Kind::Model, "Select model", rows)
+    }
+
+    fn typed(mut p: Picker, query: &str) -> Picker {
+        for c in query.chars() {
+            p.insert(c);
+        }
+        p
+    }
+
+    #[test]
+    fn a_group_name_and_a_model_fragment_can_be_typed_together() {
+        let p = typed(models(), "openrouter hy");
+        let shown: Vec<&str> = p.filtered().iter().map(|&i| p.rows[i].label.trim()).collect();
+        assert_eq!(shown, vec!["openrouter", "tencent/hy4-flash", "tencent/hy4-pro"]);
+    }
+
+    #[test]
+    fn terms_can_come_in_any_order() {
+        let p = typed(models(), "hy openrouter");
+        assert_eq!(p.filtered().len(), 3);
+    }
+
+    #[test]
+    fn scattered_letters_still_find_the_model() {
+        let p = typed(models(), "gm4");
+        assert_eq!(p.selected(), Some("google/gemini-4-neon"));
+    }
+
+    #[test]
+    fn a_tighter_match_is_listed_before_a_looser_one() {
+        let rows = vec![
+            Row::heading("openrouter"),
+            Row::item("a", "  h-x-x-y-model"),
+            Row::item("b", "  hy4-flash"),
+        ];
+        let p = typed(Picker::new(Kind::Model, "m", rows), "hy");
+        assert_eq!(p.selected(), Some("b"), "the substring beats the scattered match");
+    }
+
+    #[test]
+    fn every_term_has_to_fit() {
+        let p = typed(models(), "openrouter inkling");
+        assert!(p.filtered().is_empty(), "inkling lives under llamacpp, not openrouter");
     }
 
     #[test]
